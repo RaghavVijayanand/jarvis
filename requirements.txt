@@ -31,3 +31,5 @@ schedule
 wmi
 google-generativeai
 pytz
+asteval
+tzlocal

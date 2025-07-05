@@ -70,7 +70,7 @@ class VoiceEngine:
         
     def speak(self, text):
         """Convert text to speech with natural inflection"""
-        if not text.strip():
+        if not Config.VOICE_SETTINGS["enabled"] or not text.strip():
             return
             
         console.print(f"[blue]JARVIS:[/blue] {text}")

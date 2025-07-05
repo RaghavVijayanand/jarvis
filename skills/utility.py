@@ -2,6 +2,14 @@ import random
 import math
 import re
 from datetime import datetime, timedelta
+import pytz
+import time as time_module
+import string
+try:
+    import tzlocal
+except ImportError:
+    tzlocal = None
+from asteval import Interpreter
 
 class UtilitySkill:
     def __init__(self):
@@ -35,14 +43,11 @@ class UtilitySkill:
         try:
             # Clean the expression
             expression = expression.replace("^", "**")  # Handle exponents
-            expression = re.sub(r'[^0-9+\-*/().\s]', '', expression)  # Remove non-math characters
             
-            # Basic safety check
-            if any(word in expression.lower() for word in ["import", "exec", "eval", "__"]):
-                return "Invalid mathematical expression."
+            # Use asteval for safe evaluation
+            aeval = Interpreter()
+            result = aeval.eval(expression)
             
-            # Evaluate the expression
-            result = eval(expression)
             return f"{expression} = {result}"
             
         except ZeroDivisionError:
@@ -50,60 +55,85 @@ class UtilitySkill:
         except Exception as e:
             return f"Could not calculate '{expression}'. Please check your syntax."
     
-    def convert_units(self, value, from_unit, to_unit):
-        """Convert between common units"""
+    def convert_units_with_llm(self, query, llm_brain=None):
+        """Use LLM to handle any unit conversion query"""
         try:
-            value = float(value)
-            
-            # Temperature conversions
-            if from_unit.lower() == "celsius" and to_unit.lower() == "fahrenheit":
-                result = (value * 9/5) + 32
-                return f"{value}°C = {result:.2f}°F"
-            elif from_unit.lower() == "fahrenheit" and to_unit.lower() == "celsius":
-                result = (value - 32) * 5/9
-                return f"{value}°F = {result:.2f}°C"
-            
-            # Length conversions (to meters first, then to target)
-            length_to_meters = {
-                "mm": 0.001, "millimeter": 0.001, "millimeters": 0.001,
-                "cm": 0.01, "centimeter": 0.01, "centimeters": 0.01,
-                "m": 1, "meter": 1, "meters": 1,
-                "km": 1000, "kilometer": 1000, "kilometers": 1000,
-                "in": 0.0254, "inch": 0.0254, "inches": 0.0254,
-                "ft": 0.3048, "foot": 0.3048, "feet": 0.3048,
-                "yd": 0.9144, "yard": 0.9144, "yards": 0.9144,
-                "mi": 1609.34, "mile": 1609.34, "miles": 1609.34
-            }
-            
-            if from_unit.lower() in length_to_meters and to_unit.lower() in length_to_meters:
-                meters = value * length_to_meters[from_unit.lower()]
-                result = meters / length_to_meters[to_unit.lower()]
-                return f"{value} {from_unit} = {result:.4f} {to_unit}"
-            
-            # Weight conversions (to grams first, then to target)
-            weight_to_grams = {
-                "mg": 0.001, "milligram": 0.001, "milligrams": 0.001,
-                "g": 1, "gram": 1, "grams": 1,
-                "kg": 1000, "kilogram": 1000, "kilograms": 1000,
-                "oz": 28.3495, "ounce": 28.3495, "ounces": 28.3495,
-                "lb": 453.592, "pound": 453.592, "pounds": 453.592
-            }
-            
-            if from_unit.lower() in weight_to_grams and to_unit.lower() in weight_to_grams:
-                grams = value * weight_to_grams[from_unit.lower()]
-                result = grams / weight_to_grams[to_unit.lower()]
-                return f"{value} {from_unit} = {result:.4f} {to_unit}"
-            
-            return f"Unit conversion from {from_unit} to {to_unit} is not supported yet."
-            
-        except ValueError:
-            return "Invalid numeric value for conversion."
+            if llm_brain:
+                prompt = f"""You are a precise unit conversion assistant. Convert the following query and provide only the conversion result in a clear, concise format.
+
+Query: {query}
+
+Provide the answer in the format: "X unit = Y unit" (e.g., "2 tablespoons butter = 28.4 grams")
+
+If it's a cooking measurement, consider the ingredient type (butter, oil, sugar, flour, etc.) as they have different densities.
+Be precise with the conversion and include the ingredient name if specified.
+Only provide the conversion result, nothing else."""
+                
+                try:
+                    response = llm_brain.process_command(prompt, use_context=False)
+                    # Clean up the response to extract just the conversion
+                    lines = response.split('\n')
+                    for line in lines:
+                        if '=' in line and any(word in line.lower() for word in ['gram', 'ounce', 'pound', 'cup', 'tablespoon', 'teaspoon', 'ml', 'liter']):
+                            return line.strip()
+                    return response.strip()
+                except Exception as e:
+                    # Fallback to basic conversions if LLM fails
+                    return self._basic_conversion_fallback(query)
+            else:
+                return self._basic_conversion_fallback(query)
+                
         except Exception as e:
-            return f"Error in unit conversion: {e}"
+            return f"Error in conversion: {e}"
+    
+    def _basic_conversion_fallback(self, query):
+        """Basic hardcoded conversions as fallback"""
+        query_lower = query.lower()
+        
+        # Extract numbers and common patterns
+        numbers = re.findall(r'\d+(?:\.\d+)?', query)
+        if not numbers:
+            return "Please specify an amount to convert."
+        
+        amount = float(numbers[0])
+        
+        # Common cooking conversions
+        if 'tablespoon' in query_lower or 'tbsp' in query_lower:
+            if 'butter' in query_lower:
+                return f"{amount} tablespoons butter = {amount * 14.2:.1f} grams"
+            elif 'oil' in query_lower:
+                return f"{amount} tablespoons oil = {amount * 13.6:.1f} grams"
+            elif 'sugar' in query_lower:
+                return f"{amount} tablespoons sugar = {amount * 12.5:.1f} grams"
+            elif 'flour' in query_lower:
+                return f"{amount} tablespoons flour = {amount * 7.8:.1f} grams"
+            else:
+                return f"{amount} tablespoons = {amount * 15:.1f} grams (liquid)"
+        
+        elif 'teaspoon' in query_lower or 'tsp' in query_lower:
+            if 'butter' in query_lower:
+                return f"{amount} teaspoons butter = {amount * 4.7:.1f} grams"
+            elif 'oil' in query_lower:
+                return f"{amount} teaspoons oil = {amount * 4.5:.1f} grams"
+            else:
+                return f"{amount} teaspoons = {amount * 5:.1f} grams (liquid)"
+        
+        elif 'cup' in query_lower:
+            if 'butter' in query_lower:
+                return f"{amount} cups butter = {amount * 227:.1f} grams"
+            elif 'oil' in query_lower:
+                return f"{amount} cups oil = {amount * 218:.1f} grams"
+            elif 'sugar' in query_lower:
+                return f"{amount} cups sugar = {amount * 200:.1f} grams"
+            elif 'flour' in query_lower:
+                return f"{amount} cups flour = {amount * 125:.1f} grams"
+            else:
+                return f"{amount} cups = {amount * 240:.1f} grams (liquid)"
+        
+        return "I can help with tablespoons, teaspoons, and cups to grams conversions. Please specify the measurement and ingredient."
     
     def generate_password(self, length=12, include_symbols=True):
         """Generate a secure password"""
-        import string
         
         try:
             length = int(length)
@@ -178,18 +208,17 @@ class UtilitySkill:
     def get_current_time(self):
         """Get current local time with timezone information"""
         try:
-            import pytz
-            import time as time_module
-            
             # Try to get local timezone
-            try:
-                local_tz = pytz.timezone(time_module.tzname[0])
-            except:
-                # Fallback to system default or UTC
+            local_tz = None
+            if tzlocal:
                 try:
-                    import tzlocal
                     local_tz = tzlocal.get_localzone()
-                except:
+                except pytz.UnknownTimeZoneError:
+                    local_tz = pytz.timezone('UTC')
+            else:
+                try:
+                    local_tz = pytz.timezone(time_module.tzname[0])
+                except pytz.UnknownTimeZoneError:
                     local_tz = pytz.UTC
             
             now = datetime.now(local_tz)
@@ -198,7 +227,7 @@ class UtilitySkill:
             date_str = now.strftime("%A, %B %d, %Y")
             
             return f"The current time is {time_str} {timezone_name} on {date_str}"
-        except ImportError:
+        except Exception:
             # Fallback without timezone info
             now = datetime.now()
             time_str = now.strftime("%I:%M:%S %p")
@@ -208,24 +237,24 @@ class UtilitySkill:
     def get_current_date(self):
         """Get current date"""
         try:
-            import pytz
-            import time as time_module
-            
             # Try to get local timezone
-            try:
-                local_tz = pytz.timezone(time_module.tzname[0])
-            except:
+            local_tz = None
+            if tzlocal:
                 try:
-                    import tzlocal
                     local_tz = tzlocal.get_localzone()
-                except:
+                except pytz.UnknownTimeZoneError:
+                    local_tz = pytz.timezone('UTC')
+            else:
+                try:
+                    local_tz = pytz.timezone(time_module.tzname[0])
+                except pytz.UnknownTimeZoneError:
                     local_tz = pytz.UTC
-            
+
             now = datetime.now(local_tz)
             date_str = now.strftime("%A, %B %d, %Y")
             
             return f"Today is {date_str}"
-        except ImportError:
+        except Exception:
             now = datetime.now()
             date_str = now.strftime("%A, %B %d, %Y")
             return f"Today is {date_str}"
@@ -350,3 +379,63 @@ class UtilitySkill:
             "start", "stop", "help", "what", "how", "when", "where", "why"
         ]
         return not any(indicator in command for indicator in command_indicators)
+    
+    def convert_cooking_measurement(self, query):
+        """Convert cooking measurements from natural language queries"""
+        
+        # Normalize the query
+        query = query.lower().strip()
+        
+        # Common patterns for cooking conversions
+        patterns = [
+            # "2 tablespoons of butter in grams" or "2 tablespoon butter in grams"
+            r'(\d+(?:\.\d+)?)\s*(tablespoons?|tbsp|teaspoons?|tsp|cups?)\s*(?:of\s+)?(\w+)?\s*(?:in|to)\s*(grams?|g)',
+            # "2 tablespoons butter" (implied grams conversion)
+            r'(\d+(?:\.\d+)?)\s*(tablespoons?|tbsp|teaspoons?|tsp|cups?)\s*(?:of\s+)?(\w+)',
+            # "how much is 2 tablespoons of butter"
+            r'(?:how much is|what is)\s*(\d+(?:\.\d+)?)\s*(tablespoons?|tbsp|teaspoons?|tsp|cups?)\s*(?:of\s+)?(\w+)?'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, query)
+            if match:
+                try:
+                    amount = float(match.group(1))
+                    unit = match.group(2)
+                    ingredient = match.group(3) if len(match.groups()) >= 3 and match.group(3) else "generic"
+                    
+                    # Normalize unit names
+                    if unit in ["tablespoons", "tablespoon", "tbsp"]:
+                        unit = "tablespoons"
+                    elif unit in ["teaspoons", "teaspoon", "tsp"]:
+                        unit = "teaspoons"
+                    elif unit in ["cups", "cup"]:
+                        unit = "cups"
+                    
+                    # Try specific ingredient first, then generic
+                    conversion_key = f"{unit}_{ingredient}" if ingredient else unit
+                    
+                    # Mapping for common cooking measurements to grams
+                    cooking_conversions = {
+                        "tablespoons_butter": 14.2, "teaspoons_butter": 4.7, "cups_butter": 227,
+                        "tablespoons_oil": 13.6, "teaspoons_oil": 4.5, "cups_oil": 218,
+                        "tablespoons_sugar": 12.5, "teaspoons_sugar": 4.2, "cups_sugar": 200,
+                        "tablespoons_flour": 7.8, "teaspoons_flour": 2.6, "cups_flour": 125,
+                        "tablespoons_water": 15, "teaspoons_water": 5, "cups_water": 240,
+                        "tablespoons_milk": 15, "teaspoons_milk": 5, "cups_milk": 240,
+                        "tablespoons": 15, "teaspoons": 5, "cups": 240  # Generic liquid
+                    }
+                    
+                    if conversion_key in cooking_conversions:
+                        grams = amount * cooking_conversions[conversion_key]
+                        ingredient_text = f" of {ingredient}" if ingredient and ingredient != "generic" else ""
+                        return f"{amount} {unit}{ingredient_text} = {grams:.1f} grams"
+                    elif unit + "s" in cooking_conversions:  # Try plural form
+                        grams = amount * cooking_conversions[unit + "s"]
+                        ingredient_text = f" of {ingredient}" if ingredient and ingredient != "generic" else ""
+                        return f"{amount} {unit}{ingredient_text} = {grams:.1f} grams"
+                        
+                except ValueError:
+                    continue
+        
+        return None

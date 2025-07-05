@@ -74,6 +74,7 @@ class AgentOrchestrator:
                  multi_brain=None):
         # Initialize language model with Multi-Model Brain
         self.llm = OpenRouterLLM(multi_brain=multi_brain)
+        self._multi_brain = multi_brain
 
         # Bind provided tool instances
         self.system_control = system_control
@@ -262,6 +263,21 @@ class AgentOrchestrator:
                 description="Calculate a mathematical expression."
             ),
             Tool(
+                name="convert_units",
+                func=lambda query: self.utility_skill.convert_units_with_llm(query, self._multi_brain),
+                description="Convert between units using natural language. Examples: '2 tablespoons butter in grams', '5 km to miles', '100 fahrenheit to celsius'"
+            ),
+            Tool(
+                name="convert_cooking_measurement",
+                func=self.utility_skill.convert_cooking_measurement,
+                description="Convert cooking measurements like tablespoons, teaspoons, cups to grams. Works with natural language queries."
+            ),
+            Tool(
+                name="generate_password",
+                func=self.utility_skill.generate_password,
+                description="Generate a secure password."
+            ),
+            Tool(
                 name="flip_coin",
                 func=self.utility_skill.flip_coin,
                 description="Flip a coin."
@@ -380,14 +396,37 @@ If you cannot use tools or get an error, provide a direct response to help the u
     def run(self, query: str) -> str:
         """Run the agent on a query and return the response."""
         try:
+            # First check if this is a unit conversion query and use LLM
+            conversion_keywords = ['tablespoon', 'teaspoon', 'cup', 'gram', 'ounce', 'pound', 'celsius', 'fahrenheit', 'meter', 'feet', 'inch', 'mile', 'kilometer']
+            if any(keyword in query.lower() for keyword in conversion_keywords) and any(num_word in query for num_word in ['0','1','2','3','4','5','6','7','8','9']):
+                llm_result = self.utility_skill.convert_units_with_llm(query, self._multi_brain)
+                if llm_result and "Error" not in llm_result:
+                    return llm_result
+            
+            # Otherwise, use the agent
             result = self.agent.run(query)
             return result
         except Exception as e:
             error_msg = str(e).lower()
             # Check for parsing errors and provide helpful responses
             if "parsing" in error_msg or "format" in error_msg:
+                # Try LLM conversion as fallback
+                llm_result = self.utility_skill.convert_units_with_llm(query, self._multi_brain)
+                if llm_result and "Error" not in llm_result:
+                    return llm_result
+                # Try cooking conversion as final fallback
+                cooking_result = self.utility_skill.convert_cooking_measurement(query)
+                if cooking_result:
+                    return cooking_result
                 return f"I understand you want help with: {query}. Let me provide a direct response instead of using complex tools."
             elif "timeout" in error_msg:
                 return "The request took too long to process. Please try a simpler version of your request."
             else:
+                # Try LLM conversion as fallback for any error
+                llm_result = self.utility_skill.convert_units_with_llm(query, self._multi_brain)
+                if llm_result and "Error" not in llm_result:
+                    return llm_result
+                cooking_result = self.utility_skill.convert_cooking_measurement(query)
+                if cooking_result:
+                    return cooking_result
                 return f"I encountered an issue processing your request: {query}. Please try rephrasing your question."

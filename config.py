@@ -8,7 +8,7 @@ class Config:
     # Enhanced AI Settings - Multi-Model Support
     
     # OpenRouter Configuration
-    OPENROUTER_API_KEY = "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"
+    OPENROUTER_API_KEY = "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"
     OPENROUTER_MODEL = "deepseek/deepseek-v3"  # Default to DeepSeek V3
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
     USE_OPENROUTER = True
