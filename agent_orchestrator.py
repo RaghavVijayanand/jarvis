@@ -19,7 +19,8 @@ class OpenRouterLLM(LLM):
         """Call the Multi-Model Brain"""
         try:
             if self._multi_brain:
-                return self._multi_brain.process_command(prompt, use_context=False)
+                # Use conversation context for better continuity
+                return self._multi_brain.process_command(prompt, use_context=True)
             else:
                 # Fallback to direct OpenRouter call with a working model
                 headers = {

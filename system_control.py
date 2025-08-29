@@ -114,106 +114,209 @@ Boot Time: {datetime.fromtimestamp(psutil.boot_time()).strftime('%Y-%m-%d %H:%M:
             return result
         except Exception as e:
             return f"Error getting disk usage: {e}"
+
+    def get_cpu_usage(self):
+        """Get only current CPU usage percentage"""
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            return f"CPU Usage: {cpu_percent:.1f}%"
+        except Exception as e:
+            return f"Error getting CPU usage: {e}"
+
+    def get_memory_usage(self):
+        """Get only current memory usage summary"""
+        try:
+            memory = psutil.virtual_memory()
+            used_gb = memory.used // (1024**3)
+            total_gb = memory.total // (1024**3)
+            return f"Memory: {memory.percent:.1f}% used ({used_gb} GB / {total_gb} GB)"
+        except Exception as e:
+            return f"Error getting memory usage: {e}"
     
     def launch_application(self, app_name):
         """Launch an application with intelligent detection and verification"""
         try:
             app_name = app_name.lower().strip()
-            original_processes = set(proc.info['name'].lower() for proc in psutil.process_iter(['name']))
-            
-            # Enhanced application mappings with multiple variations
-            app_mappings = {
-                'notepad': 'notepad.exe',
+
+            # Whitelist of built-in apps we allow launching unconditionally
+            builtin_apps = {
                 'calculator': 'calc.exe',
                 'calc': 'calc.exe',
-                'paint': 'mspaint.exe',
-                'chrome': 'chrome.exe',
-                'google chrome': 'chrome.exe',
-                'firefox': 'firefox.exe',
-                'edge': 'msedge.exe',
-                'microsoft edge': 'msedge.exe',
-                'explorer': 'explorer.exe',
-                'file explorer': 'explorer.exe',
-                'cmd': 'cmd.exe',
-                'command prompt': 'cmd.exe',
-                'powershell': 'powershell.exe',
-                'task manager': 'taskmgr.exe',
-                'control panel': 'control.exe',
-                'settings': 'ms-settings:',
-                'music': 'wmplayer.exe',
-                'video': 'wmplayer.exe',
-                'discord': 'Discord.exe',
-                'steam': 'steam.exe',
-                'spotify': 'Spotify.exe',
-                'vs code': 'Code.exe',
-                'visual studio code': 'Code.exe',
-                'vscode': 'Code.exe',
-                'word': 'WINWORD.EXE',
-                'excel': 'EXCEL.EXE',
-                'powerpoint': 'POWERPNT.EXE',
-                'outlook': 'OUTLOOK.EXE',
-                'teams': 'Teams.exe',
-                'zoom': 'Zoom.exe',
-                'skype': 'Skype.exe',
-                'telegram': 'Telegram.exe',
-                'whatsapp': 'WhatsApp.exe',
-                'riot games': 'RiotClientServices.exe',
-                'riot': 'RiotClientServices.exe',
-                'league of legends': 'RiotClientServices.exe',
-                'valorant': 'RiotClientServices.exe'
+                'settings': 'ms-settings:'
             }
-            
-            # Try direct mapping first
-            if app_name in app_mappings:
-                command = app_mappings[app_name]
+
+            # Handle built-ins first
+            if app_name in builtin_apps:
+                command = builtin_apps[app_name]
                 success, message = self._try_launch_command(command, app_name)
-                if success:
-                    return message
-            
-            # Try to find the app in installed applications using the app_control
+                return message if success else message
+
+            # For all other apps, verify installation via registry first
             try:
                 from skills.app_control import ApplicationControl
                 app_control = ApplicationControl()
                 
-                # Search for partial matches in installed apps
+                # exact match
+                if app_name in app_control.installed_apps:
+                    app_info = app_control.installed_apps[app_name]
+                    if app_info.get('executable') and os.path.exists(app_info['executable']):
+                        success, message = self._try_launch_executable(app_info['executable'], app_name)
+                        return message if success else message
+                    elif app_info.get('location'):
+                        # Try to find an executable in the install directory
+                        install_path = Path(app_info['location'])
+                        if install_path.exists():
+                            exe_files = list(install_path.glob('*.exe'))
+                            if exe_files:
+                                success, message = self._try_launch_executable(str(exe_files[0]), app_name)
+                                return message if success else message
+                        return f"Could not find executable for {app_info['name']}"
+                # partial match (best-effort)
                 matches = [k for k in app_control.installed_apps.keys() if app_name in k]
                 if matches:
+                    # Prefer the shortest match
+                    matches.sort(key=len)
                     app_info = app_control.installed_apps[matches[0]]
-                    if app_info['executable'] and os.path.exists(app_info['executable']):
+                    if app_info.get('executable') and os.path.exists(app_info['executable']):
                         success, message = self._try_launch_executable(app_info['executable'], app_name)
-                        if success:
-                            return message
+                        return message if success else message
+                    elif app_info.get('location'):
+                        install_path = Path(app_info['location'])
+                        if install_path.exists():
+                            exe_files = list(install_path.glob('*.exe'))
+                            if exe_files:
+                                success, message = self._try_launch_executable(str(exe_files[0]), app_name)
+                                return message if success else message
+                        return f"Could not find executable for {app_info['name']}"
+                # Try Start Menu shortcuts (.lnk /.appref-ms)
+                shortcut_path = self._find_start_menu_shortcut(app_name)
+                if shortcut_path:
+                    success, message = self._try_launch_shortcut(shortcut_path, app_name)
+                    return message if success else message
+
+                # Try UWP/Store apps via AUMID using PowerShell Get-StartApps
+                uwp_success, uwp_message = self._launch_uwp_app_by_name(app_name)
+                if uwp_success:
+                    return uwp_message
+
+                # Last resort: search common install folders for a matching executable
+                exe_path = self._search_executable_by_name(app_name)
+                if exe_path and os.path.exists(exe_path):
+                    success, message = self._try_launch_executable(exe_path, app_name)
+                    return message if success else message
+
+                # If we reach here, we could not find the app installed
+                return f"'{app_name}' does not appear to be installed on this system."
             except:
-                pass
-            
-            # Try common installation paths
-            common_paths = [
-                f"C:\\Program Files\\{app_name}\\{app_name}.exe",
-                f"C:\\Program Files (x86)\\{app_name}\\{app_name}.exe",
-                f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Local\\{app_name}\\{app_name}.exe",
-                f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Roaming\\{app_name}\\{app_name}.exe"
-            ]
-            
-            for path in common_paths:
-                if os.path.exists(path):
-                    success, message = self._try_launch_executable(path, app_name)
-                    if success:
-                        return message
-            
-            # Try launching as-is (might be in PATH)
-            success, message = self._try_launch_command(app_name, app_name)
-            if success:
-                return message
-            
-            # Try with .exe extension
-            success, message = self._try_launch_command(f"{app_name}.exe", app_name)
-            if success:
-                return message
-            
-            return f"Could not find or launch '{app_name}'. Application may not be installed or accessible."
+                # If we cannot access registry-based detection, fall back to a conservative message
+                return f"Could not verify installation of '{app_name}'. I won't attempt to launch it."
             
         except Exception as e:
             return f"Error launching {app_name}: {e}"
+
+    def _find_start_menu_shortcut(self, app_name: str):
+        """Search Start Menu for a shortcut matching the app name (Windows)."""
+        try:
+            if self.system != "Windows":
+                return None
+            user = os.getenv('USERNAME') or ""
+            start_menu_paths = [
+                fr"C:\\Users\\{user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs",
+                r"C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs",
+            ]
+            needle = app_name.lower()
+            for base in start_menu_paths:
+                if not os.path.exists(base):
+                    continue
+                for root, _dirs, files in os.walk(base):
+                    for fname in files:
+                        name_l = fname.lower()
+                        if needle in name_l and (name_l.endswith('.lnk') or name_l.endswith('.appref-ms') or name_l.endswith('.url')):
+                            return os.path.join(root, fname)
+        except Exception:
+            return None
+        return None
+
+    def _try_launch_shortcut(self, shortcut_path: str, app_name: str):
+        """Open a .lnk/.appref-ms/.url shortcut via shell."""
+        try:
+            os.startfile(shortcut_path)
+            time.sleep(1)
+            return True, f"Successfully launched {app_name}."
+        except Exception as e:
+            return False, f"Error launching {app_name}: {e}"
+
+    def _launch_uwp_app_by_name(self, app_name: str):
+        """Attempt to launch a UWP/Store app by display name using PowerShell Get-StartApps."""
+        try:
+            if self.system != "Windows":
+                return False, "UWP apps not supported on this OS"
+            # Query AppID (AUMID) for app names containing the query
+            ps_cmd = (
+                "powershell -NoProfile -Command "
+                f"\"$app=(Get-StartApps | Where-Object {{$_.Name -like '*{app_name}*'}} | Select-Object -First 1); if($app){{$app.AppID}}\""
+            )
+            result = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True, timeout=10)
+            appid = (result.stdout or "").strip()
+            if appid:
+                # Use shell AppsFolder to launch by AUMID
+                launch_cmd = f"explorer.exe shell:AppsFolder\\{appid}"
+                run = subprocess.run(launch_cmd, shell=True, capture_output=True, text=True, timeout=10)
+                if run.returncode == 0:
+                    return True, f"Successfully launched {app_name}."
+                return False, f"Failed to launch {app_name} via UWP AppID."
+            return False, "AppID not found"
+        except subprocess.TimeoutExpired:
+            return False, f"Timeout resolving UWP AppID for {app_name}"
+        except Exception as e:
+            return False, f"Error launching UWP app {app_name}: {e}"
+
+    def _search_executable_by_name(self, app_name: str) -> str | None:
+        """Safely search for an executable whose name matches the query in common install locations."""
+        try:
+            if self.system != "Windows":
+                return None
+            user = os.getenv('USERNAME') or ""
+            base_paths = [
+                r"C:\\Program Files",
+                r"C:\\Program Files (x86)",
+                fr"C:\\Users\\{user}\\AppData\\Local",
+                fr"C:\\Users\\{user}\\AppData\\Local\\Programs",
+                fr"C:\\Users\\{user}\\AppData\\Roaming",
+            ]
+            needle = app_name.lower()
+            # Limit recursion depth: only look 2 levels deep to keep it fast
+            for base in base_paths:
+                if not os.path.exists(base):
+                    continue
+                # First pass: directories whose name contains app_name
+                try:
+                    for entry in os.scandir(base):
+                        if not entry.is_dir():
+                            continue
+                        name_l = entry.name.lower()
+                        if needle in name_l:
+                            # Look for app_name*.exe in this directory
+                            try:
+                                for sub in os.scandir(entry.path):
+                                    if sub.is_file():
+                                        fname = sub.name.lower()
+                                        if fname.endswith('.exe') and (fname == f"{needle}.exe" or fname.startswith(f"{needle}")):
+                                            return sub.path
+                                    elif sub.is_dir():
+                                        # One level deeper
+                                        for sub2 in os.scandir(sub.path):
+                                            if sub2.is_file():
+                                                fname2 = sub2.name.lower()
+                                                if fname2.endswith('.exe') and (fname2 == f"{needle}.exe" or fname2.startswith(f"{needle}")):
+                                                    return sub2.path
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
     
     def _try_launch_command(self, command, app_name):
         """Try to launch a command and verify it started"""

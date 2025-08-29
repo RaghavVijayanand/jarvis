@@ -8,15 +8,15 @@ class Config:
     # Enhanced AI Settings - Multi-Model Support
     
     # OpenRouter Configuration
-    OPENROUTER_API_KEY = "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"
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
     OPENROUTER_MODEL = "deepseek/deepseek-v3"  # Default to DeepSeek V3
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-    USE_OPENROUTER = True
+    USE_OPENROUTER = bool(OPENROUTER_API_KEY)
     
     # Gemini Configuration
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL = "gemini-pro"
-    USE_GEMINI = bool(os.getenv("GEMINI_API_KEY", ""))
+    GEMINI_MODEL = "gemini-2.0-flash-exp"
+    USE_GEMINI = bool(GEMINI_API_KEY)
     
     # Multi-Model Settings
     USE_MULTI_MODEL = True  # Enable advanced multi-model support
@@ -27,8 +27,8 @@ class Config:
         "coding": "deepseek-coder",
         "analysis": "claude-3.5-sonnet", 
         "creative": "gpt-4o",
-        "vision": "gemini-pro-vision",
-        "fast": "gemini-flash",
+        "vision": "gemini-2.0-flash",
+        "fast": "gemini-2.0-flash",
         "free": "qwen-2.5-vl",
         "reasoning": "deepseek-v3"
     }
@@ -46,6 +46,7 @@ class Config:
     
     # Enhanced Voice Settings for Natural Speech
     VOICE_SETTINGS = {
+        "enabled": True,
         "rate": 180,           # Slower rate (default 200 is too fast)
         "volume": 0.9,
         "pitch": 50,           # Mid-range pitch
@@ -133,4 +134,7 @@ class Config:
     @staticmethod
     def get_available_models():
         """Get available Gemini models"""
-        return ["gemini-pro", "gemini-pro-vision"] if Config.check_gemini_connection() else []
+        return [
+            "gemini-1.5-flash",
+            "gemini-1.5-pro"
+        ] if Config.check_gemini_connection() else []

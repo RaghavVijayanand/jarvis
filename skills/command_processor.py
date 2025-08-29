@@ -129,35 +129,77 @@ class CommandProcessor:
         return has_file_keyword and has_content_keyword
     
     def _parse_file_creation_command(self, command: str) -> List[Dict]:
-        """Parse file creation commands with content generation"""
+        """Parse file creation commands with content generation.
+        Robustly extracts filename, optional location, and topic.
+        """
         steps = []
-        
-        # Extract topic and filename
-        if "about" in command.lower():
-            parts = command.lower().split("about", 1)
-            if len(parts) > 1:
-                topic = parts[1].strip()
-                
-                # Check for filename specification
-                filename = None
-                if "save" in command.lower() or "store" in command.lower():
-                    if "as" in command.lower():
-                        filename_part = command.lower().split("as", 1)[-1].strip()
-                        filename = filename_part.replace("file", "").replace(".", "").strip()
-                        if not filename.endswith('.txt'):
-                            filename += '.txt'
-                
-                if not filename:
-                    # Generate filename from topic
-                    filename = topic.replace(" ", "_").replace(",", "").replace(".", "")[:30] + ".txt"
-                
-                steps.append({
-                    'type': 'file_creation_with_content',
-                    'topic': topic,
-                    'filename': filename,
-                    'raw_command': command
-                })
-        
+
+        text = command.strip()
+        lower = text.lower()
+
+        # Extract a topic: prefer "write about X" then generic "about X"
+        topic = None
+        m_topic = re.search(r"write\s+about\s+(.+)", lower, re.IGNORECASE)
+        if m_topic:
+            topic = m_topic.group(1).strip()
+        elif " about " in lower:
+            topic = lower.split(" about ", 1)[1].strip()
+
+        # Trim trailing phrases from topic (e.g., "and save as ...", locations, filename specs)
+        if topic:
+            topic = re.split(
+                r"\b(?:and\s+save(?:\s+it)?\s+as|save\s+as|named|called|name\s+it|call\s+it|in\s+this\s+folder|on\s+this\s+folder|in\s+folder|on\s+folder|on\s+desktop|in\s+desktop|here|with\s+name|file\s+name|filename)\b",
+                topic,
+                1,
+                flags=re.IGNORECASE,
+            )[0].strip(" .,;")
+
+        # Extract filename via multiple patterns with non-greedy + lookahead to stop at conjunctions/locations
+        filename = None
+        filename_patterns = [
+            r"(?:named|called|name\s+it|call\s+it)\s+([\w\-. ]+?)(?=\s+(?:on|in|and|with|write|save)\b|$)",
+            r"save\s+(?:it\s+)?as\s+([\w\-. ]+?)(?=\s+(?:on|in|and|with|write)\b|$)",
+            r"create\s+(?:a\s+)?file\s+([\w\-. ]+?)(?=\s+(?:on|in|and|with|write|called|named)\b|$)",
+        ]
+        for pat in filename_patterns:
+            m = re.search(pat, lower, re.IGNORECASE)
+            if m:
+                filename = m.group(1).strip().strip('\"\'')
+                break
+
+        # Clean filename of location or extra chatter and ensure extension
+        if filename:
+            filename = re.split(r"\b(?:in|on)\s+(?:this|the)\s+folder\b", filename, 1, flags=re.IGNORECASE)[0]
+            filename = re.split(r"\b(?:on|in)\s+desktop\b", filename, 1, flags=re.IGNORECASE)[0]
+            filename = re.split(r"\band\s+write\b", filename, 1, flags=re.IGNORECASE)[0]
+            filename = filename.replace(" here", "").replace(" in here", "").strip()
+
+        # Ensure txt extension by default
+        if filename and not filename.lower().endswith((".txt", ".md", ".log", ".csv")):
+            if "." not in filename:
+                filename += ".txt"
+
+        # Fallback filename from topic
+        if not filename and topic:
+            safe = re.sub(r"[^a-z0-9_\-]+", "_", topic.lower()).strip("_")
+            filename = (safe[:30] or "untitled") + ".txt"
+
+        # Detect location keywords
+        location = None
+        if any(kw in lower for kw in ["on desktop", "to desktop", "onto desktop", "in desktop"]):
+            location = "desktop"
+
+        if topic and filename:
+            steps.append(
+                {
+                    "type": "file_creation_with_content",
+                    "topic": topic,
+                    "filename": filename,
+                    "location": location,
+                    "raw_command": command,
+                }
+            )
+
         return steps
     
     def _is_app_automation_sequence(self, command: str) -> bool:
@@ -287,26 +329,40 @@ class CommandProcessor:
         """Execute file creation with AI-generated content"""
         topic = step['topic']
         filename = step['filename']
-        
-        # Generate content using AI brain
-        content_request = f"Write a detailed and informative text about {topic}. Make it comprehensive and well-structured."
-        
-        if self.jarvis.use_advanced_brain and hasattr(self.jarvis, 'openrouter_brain'):
-            content = self.jarvis.openrouter_brain.process_command(content_request)
+        location = step.get('location')
+
+        # Generate content using available brain (prefer multi-model, then OpenRouter, then native)
+        content_request = (
+            f"Write a clear, well-structured article about {topic}. Include a short intro, 3-5 bullet points, and a concise conclusion."
+        )
+
+        try:
+            if getattr(self.jarvis, 'use_multi_model', False) and getattr(self.jarvis, 'multi_brain', None):
+                content = self.jarvis.multi_brain.process_command(content_request)
+            elif getattr(self.jarvis, 'use_advanced_brain', False) and getattr(self.jarvis, 'openrouter_brain', None):
+                content = self.jarvis.openrouter_brain.process_command(content_request)
+            else:
+                raise RuntimeError("advanced brain unavailable")
+        except Exception:
+            content = (
+                f"# {topic.title()}\n\n"
+                f"Created by JARVIS on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"Key points about {topic}:\n"
+                f"- Overview paragraph explaining the topic in simple terms.\n"
+                f"- 3–5 bullet points with important facts.\n"
+                f"- Short conclusion summarizing why it matters.\n"
+            )
+
+        # Create the file in the right place
+        if location == 'desktop':
+            result = self.jarvis.file_skill.create_file_at_location(filename, content, location='desktop')
         else:
-            content = f"# {topic.title()}\n\nThis is a comprehensive text about {topic}.\n\n"
-            content += f"Generated by JARVIS on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            content += "[Note: For more detailed content, enable OpenRouter integration]\n\n"
-            content += f"Topic: {topic}\n"
-            content += "This file was created as requested. Please provide more specific requirements for detailed content."
-        
-        # Create the file
-        result = self.jarvis.file_skill.create_file(filename, content)
-        
+            result = self.jarvis.file_skill.create_file(filename, content)
+
         # Update last created file reference
         self.jarvis.last_created_file = filename
-        
-        return f"Created file '{filename}' with content about {topic}"
+
+        return result
     
     def get_command_suggestions(self, partial_command: str) -> List[str]:
         """Get command suggestions based on partial input"""

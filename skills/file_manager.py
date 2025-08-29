@@ -8,6 +8,28 @@ class FileManagerSkill:
         # Use the directory where the jarvis script is located, not the current working directory
         script_dir = Path(__file__).parent.parent.absolute()
         self.current_directory = str(script_dir)
+    
+    def file_exists(self, filename: str) -> bool:
+        """Check whether a file exists in the current directory.
+        Accepts names with or without extension and cleans invalid characters.
+        Returns True if found, otherwise False.
+        """
+        try:
+            if not filename:
+                return False
+            name = self._clean_filename(filename)
+            # Try exact
+            path = Path(self.current_directory) / name
+            if path.exists() and path.is_file():
+                return True
+            # Try with .txt fallback when no extension was provided originally
+            if not Path(name).suffix:
+                path_txt = Path(self.current_directory) / f"{name}.txt"
+                if path_txt.exists() and path_txt.is_file():
+                    return True
+            return False
+        except Exception:
+            return False
         
     def create_file(self, filename, content=""):
         """Create a new file with optional content"""

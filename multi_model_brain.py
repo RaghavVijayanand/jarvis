@@ -69,30 +69,31 @@ class MultiModelBrain:
                 "cost_per_1k_tokens": 0.0,
                 "description": "Qwen 2.5 VL - Free vision-language model"
             },
-            "gemini-pro": {
-                "provider": "gemini",
-                "model_id": "gemini-pro",
-                "context_window": 30720,
-                "supports_vision": False,
-                "cost_per_1k_tokens": 0.5,
-                "description": "Gemini Pro - Google's advanced language model"
-            },
-            "gemini-pro-vision": {
-                "provider": "gemini",
-                "model_id": "gemini-pro-vision", 
-                "context_window": 30720,
-                "supports_vision": True,
-                "cost_per_1k_tokens": 0.5,
-                "description": "Gemini Pro Vision - Google's multimodal model"
-            },
-            "gemini-flash": {
+            "gemini-1.5-flash": {
                 "provider": "gemini",
                 "model_id": "gemini-1.5-flash",
                 "context_window": 1000000,
                 "supports_vision": True,
                 "cost_per_1k_tokens": 0.075,
-                "description": "Gemini Flash - Fast and efficient model"
-            }
+                "description": "Gemini 1.5 Flash - Fast, low-cost multimodal model"
+            },
+            "gemini-2.0-flash": {
+                "provider": "gemini",
+                "model_id": "gemini-2.0-flash-exp",
+                "context_window": 1000000,
+                "supports_vision": True,
+                "cost_per_1k_tokens": 0.075,
+                "description": "Gemini 2.0 Flash - Latest fast multimodal model with improved reasoning"
+            },
+            "gemini-1.5-pro": {
+                "provider": "gemini",
+                "model_id": "gemini-1.5-pro", 
+                "context_window": 1000000,
+                "supports_vision": True,
+                "cost_per_1k_tokens": 3.0,
+                "description": "Gemini 1.5 Pro - Higher capability multimodal model"
+            },
+            
         }
         
         # Initialize available providers
@@ -148,10 +149,18 @@ class MultiModelBrain:
     
     def _test_gemini_connection(self):
         """Test Gemini API connection"""
-        model = genai.GenerativeModel('gemini-pro')
-        response = model.generate_content("Hello", request_options={"timeout": 10})
-        if not response.text:
-            raise Exception("Gemini API test failed")
+        try:
+            # Try Gemini 2.0 Flash first
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            response = model.generate_content("Hello", request_options={"timeout": 10})
+            if response.text:
+                return
+        except Exception:
+            # Fallback to Gemini 1.5 Flash
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            response = model.generate_content("Hello", request_options={"timeout": 10})
+            if not response.text:
+                raise Exception("Gemini API test failed")
     
     def _check_local_models(self):
         """Check for available local models (Ollama, etc.)"""
@@ -176,13 +185,15 @@ class MultiModelBrain:
     
     def _set_default_model(self):
         """Set the default model based on availability and preferences"""
-        # Priority order for default model
+        # Priority order for default model - Gemini 2.0 Flash first
         preferred_models = [
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
             "qwen-2.5",  # Updated to our corrected model name
             "claude-3.5-sonnet", 
             "gpt-4o-mini",
             "deepseek-coder",
-            "gemini-pro",
+            "gemini-1.5-pro",
             "llama-3.3-70b",
             "mistral-large"
         ]
