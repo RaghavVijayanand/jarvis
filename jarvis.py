@@ -499,17 +499,44 @@ Intent:"""
         
         # Clean up the command for better math detection
         math_query = command.lower()
-        math_query = re.sub(r'\b(what\s+is|calculate|math|compute|solve)\b', '', math_query).strip()
+        
+        # Remove common question words and phrases
+        math_query = re.sub(r'\b(what\s+is|whats|what\'s|calculate|math|compute|solve|tell\s+me)\b', '', math_query).strip()
+        
+        # Replace word operators with symbols
+        math_query = re.sub(r'\bplus\b', '+', math_query)
+        math_query = re.sub(r'\bminus\b', '-', math_query)
+        math_query = re.sub(r'\btimes\b', '*', math_query)
+        math_query = re.sub(r'\bmultiplied\s+by\b', '*', math_query)
+        math_query = re.sub(r'\bdivided\s+by\b', '/', math_query)
+        math_query = re.sub(r'\bx\b', '*', math_query)  # Handle "10x10" as "10*10"
+        math_query = re.sub(r'×', '*', math_query)
+        math_query = re.sub(r'÷', '/', math_query)
+        
+        # Clean up extra spaces
+        math_query = re.sub(r'\s+', '', math_query)
         
         # Look for mathematical patterns
-        math_pattern = r'[-+]?\d*\.?\d+\s*[+\-*/×÷]\s*[-+]?\d*\.?\d+'
-        if re.search(math_pattern, math_query) or any(op in math_query for op in ['+', '-', '*', '/', '×', '÷', 'plus', 'minus', 'times', 'divided']):
-            result = self.utility_skill.calculate(math_query)
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return True
+        math_pattern = r'^\s*[-+]?\d*\.?\d+\s*[+\-*/]\s*[-+]?\d*\.?\d+\s*$'
+        
+        if re.match(math_pattern, math_query) or any(op in math_query for op in ['+', '-', '*', '/']):
+            try:
+                # Use eval for simple math expressions (safe since we've cleaned the input)
+                result = eval(math_query)
+                response = f"{command.strip()} = {result}"
+                if use_voice:
+                    self.voice_engine.speak(response)
+                else:
+                    console.print(f"[blue]JARVIS:[/blue] {response}")
+                return True
+            except:
+                # Fallback to utility skill
+                result = self.utility_skill.calculate(math_query)
+                if use_voice:
+                    self.voice_engine.speak(result)
+                else:
+                    console.print(f"[blue]JARVIS:[/blue] {result}")
+                return True
         else:
             # If no clear math expression, let it go to general AI
             return False
@@ -599,21 +626,46 @@ Intent:"""
 
     def _handle_app_commands(self, command, use_voice=True):
         """Handle application launching commands"""
+        import re
         command_lower = command.lower()
         
-        # Extract app name
-        app_name = command_lower
-        for prefix in ["open ", "launch ", "start ", "run "]:
-            if app_name.startswith(prefix):
-                app_name = app_name[len(prefix):].strip()
+        # Look for app launch patterns in the command
+        # Pattern 1: "open/launch/start/run + app_name"
+        app_patterns = [
+            r'\b(?:open|launch|start|run)\s+(\w+)',
+            r'\bopen\s+(\w+)',
+            r'\blaunch\s+(\w+)',
+            r'\bstart\s+(\w+)',
+            r'\brun\s+(\w+)'
+        ]
+        
+        app_name = None
+        for pattern in app_patterns:
+            match = re.search(pattern, command_lower)
+            if match:
+                app_name = match.group(1)
                 break
         
-        result = self.system_control.launch_application(app_name)
-        if use_voice:
-            self.voice_engine.speak(result)
+        # If no pattern matched, try simple extraction
+        if not app_name:
+            for prefix in ["open ", "launch ", "start ", "run "]:
+                if prefix in command_lower:
+                    parts = command_lower.split(prefix)
+                    if len(parts) > 1:
+                        # Take the first word after the prefix
+                        app_name = parts[1].split()[0] if parts[1].split() else None
+                        break
+        
+        if app_name:
+            result = self.system_control.launch_application(app_name)
+            if use_voice:
+                self.voice_engine.speak(result)
+            else:
+                console.print(f"[blue]JARVIS:[/blue] {result}")
+            return True
         else:
-            console.print(f"[blue]JARVIS:[/blue] {result}")
-        return True
+            # No clear app name found, let AI handle it
+            return False
 
     def _handle_utility_commands(self, command, use_voice=True):
         """Handle utility/fun commands"""
