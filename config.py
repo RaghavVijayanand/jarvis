@@ -3,6 +3,64 @@ import json
 import requests
 from pathlib import Path
 
+# Lightweight .env loader/saver for GUI settings (stored in %APPDATA%/Jarvis/.env on Windows)
+from pathlib import Path as _Path
+
+APPDATA_DIR = _Path(os.getenv("APPDATA", str(_Path.home()))) / "Jarvis"
+ENV_PATH = APPDATA_DIR / ".env"
+
+def load_env():
+    try:
+        from dotenv import load_dotenv
+        APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+        load_dotenv(dotenv_path=str(ENV_PATH), override=True)
+        
+        # Set default location to Chennai if not specified
+        if not os.getenv("JARVIS_LOCATION"):
+            os.environ["JARVIS_LOCATION"] = "Chennai, India"
+            
+    except Exception:
+        # Best-effort load; ignore if dotenv not available
+        # Set default location
+        os.environ.setdefault("JARVIS_LOCATION", "Chennai, India")
+
+def save_api_keys(openrouter_key: str | None, gemini_key: str | None):
+    """Persist API keys to the per-user .env and set process env vars.
+
+    This doesn't validate keys; it only stores them.
+    """
+    APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+    existing = ""
+    if ENV_PATH.exists():
+        try:
+            existing = ENV_PATH.read_text(encoding="utf-8")
+        except Exception:
+            existing = ""
+
+    def replace_line(text: str, var: str, value: str | None) -> str:
+        lines = text.splitlines(True)
+        lines = [ln for ln in lines if not ln.startswith(f"{var}=")]
+        if value is not None and value != "":
+            lines.append(f"{var}={value}\n")
+        return "".join(lines)
+
+    updated = existing
+    if openrouter_key is not None:
+        updated = replace_line(updated, "OPENROUTER_API_KEY", openrouter_key)
+        os.environ["OPENROUTER_API_KEY"] = openrouter_key
+    if gemini_key is not None:
+        updated = replace_line(updated, "GEMINI_API_KEY", gemini_key)
+        os.environ["GEMINI_API_KEY"] = gemini_key
+
+    try:
+        ENV_PATH.write_text(updated, encoding="utf-8")
+    except Exception:
+        # Ignore write errors silently
+        pass
+
+# Load env early so Config sees vars
+load_env()
+
 # Advanced JARVIS Configuration
 class Config:
     # Enhanced AI Settings - Multi-Model Support

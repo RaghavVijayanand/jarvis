@@ -29,7 +29,8 @@ pycaw
 winshell
 schedule
 wmi
-google-generativeai
 pytz
 asteval
 tzlocal
+PySide6==6.7.3
+pyinstaller==6.10.0

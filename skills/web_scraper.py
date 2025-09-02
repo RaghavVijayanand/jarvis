@@ -18,8 +18,11 @@ class WebScraperSkill:
     def search_google(self, query, num_results=5):
         """Search Google and return results without opening browser"""
         try:
-            # Use Google search URL
-            search_url = f"https://www.google.com/search?q={quote(query)}&num={num_results}"
+            # Use Google search URL with additional parameters for better results
+            search_url = f"https://www.google.com/search?q={quote(query)}&num={num_results}&hl=en"
+            
+            # Add random delay to avoid being blocked
+            time.sleep(random.uniform(1, 3))
             
             response = self.session.get(search_url, timeout=self.timeout)
             response.raise_for_status()
@@ -28,54 +31,218 @@ class WebScraperSkill:
             
             results = []
             
-            # Find search result containers
-            search_containers = soup.find_all('div', class_='g')
+            # Try multiple selectors for search results
+            search_containers = (
+                soup.find_all('div', class_='g') or
+                soup.find_all('div', {'data-hveid': True}) or
+                soup.find_all('div', class_='tF2Cxc') or
+                soup.find_all('div', class_='kCrYT')
+            )
             
             for container in search_containers[:num_results]:
                 try:
-                    # Get title
-                    title_element = container.find('h3')
+                    # Get title - try multiple selectors
+                    title_element = (
+                        container.find('h3') or
+                        container.find('h3', class_='LC20lb') or
+                        container.find('h3', class_='r') or
+                        container.find('a')
+                    )
                     title = title_element.get_text() if title_element else "No title"
                     
-                    # Get URL
-                    link_element = container.find('a', href=True)
-                    url = link_element['href'] if link_element else ""
+                    # Get URL - try multiple selectors
+                    link_element = (
+                        container.find('a', href=True) or
+                        container.find('a', {'data-ved': True})
+                    )
+                    url = ""
+                    if link_element and link_element.get('href'):
+                        href = link_element['href']
+                        if href.startswith('/url?q='):
+                            # Extract actual URL from Google redirect
+                            url = href.split('/url?q=')[1].split('&')[0]
+                        elif href.startswith('http'):
+                            url = href
                     
-                    # Get snippet
-                    snippet_elements = container.find_all(['span', 'div'], class_=['st', 'VwiC3b'])
+                    # Get snippet - try multiple selectors
+                    snippet_elements = (
+                        container.find_all(['span', 'div'], class_=['st', 'VwiC3b', 'yXK7lf', 's3v9rd']) or
+                        container.find_all(['span', 'div'], string=re.compile(r'.{20,}'))
+                    )
                     snippet = ""
                     for elem in snippet_elements:
                         text = elem.get_text()
-                        if len(text) > 20:  # Filter out very short text
-                            snippet = text
+                        if len(text) > 30 and not any(skip in text.lower() for skip in ['javascript', 'cookie', 'privacy']):
+                            snippet = text[:300]  # Limit snippet length
                             break
                     
-                    if title and url:
+                    if title and len(title) > 2:  # Ensure we have meaningful content
                         results.append({
-                            'title': title,
-                            'url': url,
-                            'snippet': snippet
+                            'title': title.strip(),
+                            'url': url.strip(),
+                            'snippet': snippet.strip()
                         })
                         
                 except Exception:
                     continue
             
-            if results:
-                formatted_results = f"Google search results for '{query}':\n\n"
+            # Also try to get featured snippet or direct answer
+            featured_snippet = self._get_featured_snippet(soup)
+            
+            if results or featured_snippet:
+                formatted_results = f"🔍 Search results for '{query}':\n\n"
+                
+                if featured_snippet:
+                    formatted_results += f"📌 Featured Answer:\n{featured_snippet}\n\n"
+                
                 for i, result in enumerate(results, 1):
                     formatted_results += f"{i}. {result['title']}\n"
-                    formatted_results += f"   URL: {result['url']}\n"
+                    if result['url']:
+                        formatted_results += f"   🔗 {result['url']}\n"
                     if result['snippet']:
-                        formatted_results += f"   Summary: {result['snippet'][:200]}...\n"
+                        formatted_results += f"   💬 {result['snippet']}\n"
                     formatted_results += "\n"
                 
                 return formatted_results.strip()
             else:
-                return f"No search results found for '{query}'"
+                return self._try_alternative_search(query)
                 
         except Exception as e:
-            return f"Error searching Google: {e}"
+            return self._try_alternative_search(query)
     
+    def _get_featured_snippet(self, soup):
+        """Extract featured snippet from Google search results"""
+        try:
+            # Try different selectors for featured snippets
+            featured_selectors = [
+                'div[data-attrid="wa:/description"]',
+                'div.kno-rdesc span',
+                'div.Z0LcW',
+                'div.hgKElc',
+                'div.kp-blk',
+                'span.hgKElc'
+            ]
+            
+            for selector in featured_selectors:
+                element = soup.select_one(selector)
+                if element:
+                    text = element.get_text().strip()
+                    if len(text) > 20:
+                        return text[:500]  # Limit length
+            
+            return None
+            
+        except Exception:
+            return None
+    
+    def _try_alternative_search(self, query):
+        """Try alternative search methods when Google fails"""
+        try:
+            # Try DuckDuckGo as fallback
+            ddg_url = f"https://duckduckgo.com/html/?q={quote(query)}"
+            response = self.session.get(ddg_url, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                results = []
+                
+                # DuckDuckGo result containers
+                for result_div in soup.find_all('div', class_='result')[:3]:
+                    title_elem = result_div.find('a', class_='result__a')
+                    snippet_elem = result_div.find('a', class_='result__snippet')
+                    
+                    if title_elem:
+                        title = title_elem.get_text()
+                        url = title_elem.get('href', '')
+                        snippet = snippet_elem.get_text() if snippet_elem else ""
+                        
+                        results.append(f"• {title}\n  {snippet[:150]}...")
+                
+                if results:
+                    return f"🔍 Search results for '{query}' (via DuckDuckGo):\n\n" + "\n\n".join(results)
+            
+            # Final fallback
+            return f"Search temporarily unavailable for '{query}'. Try these links:\n\n🔗 Google: https://www.google.com/search?q={quote(query)}\n🔗 DuckDuckGo: https://duckduckgo.com/?q={quote(query)}"
+            
+        except Exception:
+            return f"No search results found for '{query}'"
+    
+    def search_google_with_urls(self, query, num_results=5):
+        """Search Google and return structured results with URLs for further processing"""
+        try:
+            # Use Google search URL with additional parameters for better results
+            search_url = f"https://www.google.com/search?q={quote(query)}&num={num_results}&hl=en"
+            
+            # Add random delay to avoid being blocked
+            time.sleep(random.uniform(1, 3))
+            
+            response = self.session.get(search_url, timeout=self.timeout)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            results = []
+            
+            # Try multiple selectors for search results
+            search_containers = (
+                soup.find_all('div', class_='g') or
+                soup.find_all('div', {'data-hveid': True}) or
+                soup.find_all('div', class_='tF2Cxc') or
+                soup.find_all('div', class_='kCrYT')
+            )
+            
+            for container in search_containers[:num_results]:
+                try:
+                    # Get title - try multiple selectors
+                    title_element = (
+                        container.find('h3') or
+                        container.find('h3', class_='LC20lb') or
+                        container.find('h3', class_='r') or
+                        container.find('a')
+                    )
+                    title = title_element.get_text() if title_element else "No title"
+                    
+                    # Get URL - try multiple selectors
+                    link_element = (
+                        container.find('a', href=True) or
+                        container.find('a', {'data-ved': True})
+                    )
+                    url = ""
+                    if link_element and link_element.get('href'):
+                        href = link_element['href']
+                        if href.startswith('/url?q='):
+                            # Extract actual URL from Google redirect
+                            url = href.split('/url?q=')[1].split('&')[0]
+                        elif href.startswith('http'):
+                            url = href
+                    
+                    # Get snippet - try multiple selectors
+                    snippet_elements = (
+                        container.find_all(['span', 'div'], class_=['st', 'VwiC3b', 'yXK7lf', 's3v9rd']) or
+                        container.find_all(['span', 'div'], string=re.compile(r'.{20,}'))
+                    )
+                    snippet = ""
+                    for elem in snippet_elements:
+                        text = elem.get_text()
+                        if len(text) > 30 and not any(skip in text.lower() for skip in ['javascript', 'cookie', 'privacy']):
+                            snippet = text[:300]  # Limit snippet length
+                            break
+                    
+                    if title and len(title) > 2 and url:  # Ensure we have meaningful content and URL
+                        results.append({
+                            'title': title.strip(),
+                            'url': url.strip(),
+                            'snippet': snippet.strip()
+                        })
+                        
+                except Exception:
+                    continue
+            
+            return results
+            
+        except Exception as e:
+            return []
+
     def search_wikipedia(self, query):
         """Search Wikipedia and get article summary"""
         try:

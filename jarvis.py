@@ -616,10 +616,17 @@ Intent:"""
         elif "news" in command_lower or "headlines" in command_lower:
             result = self.web_skill.get_news_headlines()
         else:
-            result = self.web_skill.search_web(query, open_browser=True)
+            # Use comprehensive search with LLM summarization
+            result = self.web_skill.search_web(query, open_browser=False, llm_brain=self.brain)
         
         if use_voice:
-            self.voice_engine.speak(result)
+            # For voice output, provide a shorter summary
+            if len(result) > 500:
+                summary_lines = result.split('\n')[:5]  # First few lines
+                voice_result = '\n'.join(summary_lines) + "\n\nDetailed results available in the interface."
+                self.voice_engine.speak(voice_result)
+            else:
+                self.voice_engine.speak(result)
         else:
             console.print(f"[blue]JARVIS:[/blue] {result}")
         return True
@@ -1915,6 +1922,9 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 
             except KeyboardInterrupt:
                 console.print("\n[yellow]Text mode interrupted by user[/yellow]")
+                break
+            except EOFError:
+                console.print("\n[yellow]Text mode ended (EOF)[/yellow]")
                 break
             except Exception as e:
                 console.print(f"[red]Text mode error: {e}[/red]")

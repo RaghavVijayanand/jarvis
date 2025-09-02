@@ -9,6 +9,44 @@ class FileManagerSkill:
         script_dir = Path(__file__).parent.parent.absolute()
         self.current_directory = str(script_dir)
     
+    def handle_file_command(self, command: str) -> str:
+        """Handle file-related commands"""
+        command_lower = command.lower()
+        
+        if 'create' in command_lower and 'file' in command_lower:
+            # Extract filename from command
+            words = command.split()
+            filename = None
+            for i, word in enumerate(words):
+                if word.lower() in ['file', 'create'] and i + 1 < len(words):
+                    filename = words[i + 1]
+                    break
+            
+            if filename:
+                return self.create_file(filename)
+            else:
+                return "Please specify a filename to create."
+        
+        elif 'list' in command_lower or 'show' in command_lower:
+            return self.list_files()
+        
+        elif 'delete' in command_lower or 'remove' in command_lower:
+            # Extract filename from command
+            words = command.split()
+            filename = None
+            for i, word in enumerate(words):
+                if word.lower() in ['delete', 'remove'] and i + 1 < len(words):
+                    filename = words[i + 1]
+                    break
+            
+            if filename:
+                return self.delete_file(filename)
+            else:
+                return "Please specify a filename to delete."
+        
+        else:
+            return "I can help you create, list, or delete files. Try commands like 'create file test.txt' or 'list files'."
+    
     def file_exists(self, filename: str) -> bool:
         """Check whether a file exists in the current directory.
         Accepts names with or without extension and cleans invalid characters.

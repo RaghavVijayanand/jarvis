@@ -39,6 +39,50 @@ class SystemMonitor:
             'temp_critical': 85
         }
     
+    def get_system_info(self) -> str:
+        """Get basic system information for quick reference"""
+        try:
+            # Get current system stats
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            
+            # Get disk usage for Windows (use C:)
+            try:
+                disk_usage = psutil.disk_usage('C:' if os.name == 'nt' else '/')
+                disk_percent = (disk_usage.used / disk_usage.total * 100)
+            except:
+                disk_percent = 0
+                disk_usage = None
+            
+            # Get system uptime
+            boot_time = psutil.boot_time()
+            uptime = datetime.now() - datetime.fromtimestamp(boot_time)
+            
+            # Format uptime nicely
+            days = uptime.days
+            hours, remainder = divmod(uptime.seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            uptime_str = f"{days}d {hours}h {minutes}m"
+            
+            info = f"""CPU Usage: {cpu_percent}%
+Memory Usage: {memory.percent}% ({self._format_bytes(memory.used)}/{self._format_bytes(memory.total)})
+Disk Usage: {disk_percent:.1f}%
+Uptime: {uptime_str}
+Processes: {len(psutil.pids())}"""
+            
+            return info
+            
+        except Exception as e:
+            return f"Error getting system info: {str(e)}"
+    
+    def _format_bytes(self, bytes_value):
+        """Format bytes to human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_value < 1024.0:
+                return f"{bytes_value:.2f} {unit}"
+            bytes_value /= 1024.0
+        return f"{bytes_value:.2f} PB"
+    
     def get_detailed_system_info(self) -> str:
         """Get comprehensive system information"""
         try:

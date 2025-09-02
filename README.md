@@ -30,6 +30,27 @@ A sophisticated AI assistant inspired by Tony Stark's JARVIS from Iron Man.
    python jarvis.py
    ```
 
+## Windows GUI (Safe)
+
+This repo includes a safe GUI app for multi-model chat (no system-control actions).
+
+Run the GUI:
+```powershell
+py -3 -m venv .venv
+. .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python .\main_gui.py
+```
+
+Add API keys in Settings (saved to `%APPDATA%\Jarvis\.env`). Available models will appear in the dropdown. Responses are stubbed until you wire real provider calls.
+
+Build a single EXE:
+```powershell
+pyinstaller --noconsole --onefile --name JarvisAI --icon assets\app.ico main_gui.py
+```
+
+Create an installer with Inno Setup: open `installer.iss` and Build. Output: `dist\JarvisAI-Installer.exe`.
+
 ## Voice Commands
 
 - "Hey JARVIS" - Wake up command

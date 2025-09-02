@@ -2,7 +2,6 @@ import pyttsx3
 import speech_recognition as sr
 import threading
 import time
-import re
 from config import Config
 from rich.console import Console
 
@@ -17,36 +16,9 @@ class VoiceEngine:
         # Initialize speech recognition
         try:
             self.recognizer = sr.Recognizer()
-            # Default microphone (system default)
             self.microphone = sr.Microphone()
-            self.mic_index = getattr(self.microphone, 'device_index', None)
-            # Log selected microphone
-            try:
-                names = sr.Microphone.list_microphone_names()
-                name = None
-                if self.mic_index is not None and 0 <= self.mic_index < len(names):
-                    name = names[self.mic_index]
-                else:
-                    # Resolve default device via PyAudio when index is None
-                    pa = sr.Microphone.get_pyaudio()
-                    try:
-                        info = pa.get_default_input_device_info()
-                        self.mic_index = info.get('index', None)
-                        if self.mic_index is not None and 0 <= self.mic_index < len(names):
-                            name = names[self.mic_index]
-                        else:
-                            name = info.get('name', 'Default Input Device')
-                    finally:
-                        # Terminate PyAudio instance to release resources
-                        try:
-                            pa.terminate()
-                        except Exception:
-                            pass
-                if name:
-                    console.print(f"[cyan]Using microphone: {name} (index: {self.mic_index if self.mic_index is not None else 'default'})[/cyan]")
-            except Exception:
-                pass
             self.sr_available = True
+            self.selected_mic_index = None  # Default microphone
             self.calibrate_microphone()
             console.print("[green]✅ Voice recognition initialized[/green]")
         except Exception as e:
@@ -123,36 +95,11 @@ class VoiceEngine:
     
     def process_text_for_natural_speech(self, text):
         """Process text to make it sound more natural when spoken"""
-        original = text.strip()
-
-        # 1) Transform common metric lines into natural sentences with context
-        # CPU: "CPU Usage: 5.1%" -> "Current CPU usage is 5.1 percent — load is low." 
-        cpu_match = re.search(r"CPU\s*Usage:\s*([\d\.]+)%", original, re.IGNORECASE)
-        if cpu_match:
-            val = float(cpu_match.group(1))
-            if val < 15:
-                load = "low"
-            elif val < 50:
-                load = "moderate"
-            elif val < 80:
-                load = "high"
-            else:
-                load = "critical"
-            original = f"Current CPU usage is {val:.1f} percent — load is {load}."
-
-        # Memory: "Memory: 53.0% used (9 GB / 17 GB)"
-        mem_match = re.search(r"Memory:\s*([\d\.]+)%\s*used\s*\((\d+)\s*GB\s*/\s*(\d+)\s*GB\)", original, re.IGNORECASE)
-        if mem_match:
-            pct = float(mem_match.group(1))
-            used = int(mem_match.group(2))
-            total = int(mem_match.group(3))
-            original = f"Memory usage is {pct:.1f} percent — {used} of {total} gigabytes in use."
-
-        # 2) Add slight pauses for better pacing (engine-friendly)
-        processed = original.replace('. ', '. ... ')
-        processed = processed.replace(', ', ', . ')
-        processed = processed.replace('!', '! ... ')
-        processed = processed.replace('?', '? ... ')
+        # Add slight pauses for better pacing
+        processed = text.replace('. ', '. ... ')  # Pause after sentences
+        processed = processed.replace(', ', ', . ')  # Slight pause after commas
+        processed = processed.replace('!', '! ... ')  # Pause after exclamations
+        processed = processed.replace('?', '? ... ')  # Pause after questions
         
         # Emphasize certain words for JARVIS personality
         emphasis_words = {
@@ -235,6 +182,49 @@ class VoiceEngine:
         finally:
             self.is_listening = False
     
+    def listen_continuously(self, timeout=30, phrase_timeout=3, energy_threshold=300):
+        """Listen continuously with better patience for voice chat"""
+        if not self.sr_available:
+            console.print("[yellow]Voice recognition not available[/yellow]")
+            return None
+            
+        self.is_listening = True
+        console.print("[cyan]🎤 Listening continuously... (speak when ready)[/cyan]")
+        
+        try:
+            with self.microphone as source:
+                # Adjust for ambient noise first
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                
+                # Set energy threshold for better voice detection
+                self.recognizer.energy_threshold = energy_threshold
+                
+                # Listen for audio with longer timeout and shorter phrase timeout
+                audio = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_timeout)
+            
+            console.print("[yellow]🔄 Processing speech...[/yellow]")
+            
+            # Recognize speech using Google's service
+            try:
+                command = self.recognizer.recognize_google(audio).lower()
+                console.print(f"[green]🎯 Recognized: '{command}'[/green]")
+                return command
+            except sr.UnknownValueError:
+                console.print("[yellow]⚠️ Could not understand audio clearly[/yellow]")
+                return None
+            except sr.RequestError as e:
+                console.print(f"[red]❌ Speech recognition error: {e}[/red]")
+                return None
+                
+        except sr.WaitTimeoutError:
+            # Don't show timeout message for continuous listening - it's expected
+            return None
+        except Exception as e:
+            console.print(f"[red]❌ Error during listening: {e}[/red]")
+            return None
+        finally:
+            self.is_listening = False
+    
     def listen_for_wake_word(self, wake_word=None):
         """Listen continuously for wake word"""
         if not self.sr_available:
@@ -297,71 +287,59 @@ class VoiceEngine:
         """Test the current voice with a sample phrase"""
         test_phrase = "Good afternoon, Sir. All systems are operational and ready for your commands."
         self.speak(test_phrase)
-
-    # -------------------- Microphone utilities --------------------
-    def list_input_devices(self):
-        """Return a list of available microphone device names."""
-        try:
-            return sr.Microphone.list_microphone_names()
-        except Exception as e:
-            console.print(f"[red]Could not list microphones: {e}[/red]")
+    
+    def get_available_microphones(self):
+        """Get list of available microphones"""
+        if not self.sr_available:
             return []
-
-    def get_current_microphone_info(self):
-        """Return a dict with current mic index and name (best-effort)."""
-        info = {"index": self.mic_index, "name": None}
+        
         try:
-            names = self.list_input_devices()
-            if self.mic_index is not None and 0 <= self.mic_index < len(names):
-                info["name"] = names[self.mic_index]
-            else:
-                # Determine default device name via PyAudio
-                pa = sr.Microphone.get_pyaudio()
-                try:
-                    dev = pa.get_default_input_device_info()
-                    info["index"] = dev.get('index', None)
-                    idx = info["index"]
-                    if idx is not None and 0 <= idx < len(names):
-                        info["name"] = names[idx]
-                    else:
-                        info["name"] = dev.get('name', 'Default Input Device')
-                finally:
-                    try:
-                        pa.terminate()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        return info
-
-    def set_microphone(self, index_or_name):
-        """Select a specific microphone by index or partial name (case-insensitive)."""
-        try:
-            names = self.list_input_devices()
-            target_index = None
-            # Try integer index
-            if isinstance(index_or_name, int):
-                target_index = index_or_name
-            else:
-                s = str(index_or_name).strip()
-                if s.isdigit():
-                    target_index = int(s)
-                else:
-                    # Partial name match
-                    lower = s.lower()
-                    for i, n in enumerate(names):
-                        if lower in n.lower():
-                            target_index = i
-                            break
-            if target_index is None or target_index < 0 or target_index >= len(names):
-                return False, f"Microphone not found: {index_or_name}"
-
-            # Recreate microphone with the chosen device
-            self.microphone = sr.Microphone(device_index=target_index)
-            self.mic_index = target_index
-            # Recalibrate for the new device
-            self.calibrate_microphone()
-            console.print(f"[green]Microphone set to: {names[target_index]} (index {target_index})[/green]")
-            return True, f"Using microphone: {names[target_index]}"
+            mic_list = sr.Microphone.list_microphone_names()
+            microphones = []
+            for i, name in enumerate(mic_list):
+                microphones.append({
+                    'index': i,
+                    'name': name,
+                    'is_default': i == 0
+                })
+            return microphones
         except Exception as e:
-            return False, f"Failed to set microphone: {e}"
+            console.print(f"[red]Error getting microphones: {e}[/red]")
+            return []
+    
+    def set_microphone(self, mic_index):
+        """Set the microphone to use for speech recognition"""
+        if not self.sr_available:
+            return False
+        
+        try:
+            # Test if the microphone index is valid
+            mic_list = sr.Microphone.list_microphone_names()
+            if 0 <= mic_index < len(mic_list):
+                self.selected_mic_index = mic_index
+                self.microphone = sr.Microphone(device_index=mic_index)
+                console.print(f"[green]Microphone set to: {mic_list[mic_index]}[/green]")
+                
+                # Recalibrate with new microphone
+                self.calibrate_microphone()
+                return True
+            else:
+                console.print(f"[red]Invalid microphone index: {mic_index}[/red]")
+                return False
+        except Exception as e:
+            console.print(f"[red]Error setting microphone: {e}[/red]")
+            return False
+    
+    def get_current_microphone_info(self):
+        """Get info about the currently selected microphone"""
+        if not self.sr_available:
+            return "Speech recognition not available"
+        
+        try:
+            mic_list = sr.Microphone.list_microphone_names()
+            if self.selected_mic_index is not None:
+                return f"Current: {mic_list[self.selected_mic_index]} (Index: {self.selected_mic_index})"
+            else:
+                return f"Default microphone: {mic_list[0] if mic_list else 'None'}"
+        except Exception as e:
+            return f"Error getting microphone info: {e}"

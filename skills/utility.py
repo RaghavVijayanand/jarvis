@@ -41,14 +41,33 @@ class UtilitySkill:
     def calculate(self, expression):
         """Perform mathematical calculations"""
         try:
-            # Clean the expression
-            expression = expression.replace("^", "**")  # Handle exponents
+            # Clean the expression and extract math parts
+            # Remove common command words including contractions
+            words_to_remove = ['calculate', 'calc', 'what', 'whats', "what's", 'is', 'equals', 'solve', 'compute']
+            cleaned_expression = expression.lower()
+            
+            # Use word boundaries to avoid partial replacements
+            import re
+            for word in words_to_remove:
+                # Replace whole words only
+                pattern = r'\b' + re.escape(word) + r'\b'
+                cleaned_expression = re.sub(pattern, ' ', cleaned_expression)
+            
+            # Clean up spacing and extract mathematical expression
+            cleaned_expression = ' '.join(cleaned_expression.split())  # Remove extra spaces
+            
+            # Handle exponents
+            cleaned_expression = cleaned_expression.replace("^", "**")
+            
+            # If expression is empty after cleaning, return original
+            if not cleaned_expression.strip():
+                cleaned_expression = expression.replace("^", "**")
             
             # Use asteval for safe evaluation
             aeval = Interpreter()
-            result = aeval.eval(expression)
+            result = aeval.eval(cleaned_expression)
             
-            return f"{expression} = {result}"
+            return f"{cleaned_expression} = {result}"
             
         except ZeroDivisionError:
             return "Error: Division by zero"

@@ -1,512 +1,328 @@
 """
-Multi-Model AI Brain for JARVIS
-Supports DeepSeek V3, Gemini, OpenRouter models, and more
-"""
+Multi-Model AI Brain for JARVIS (safe mode)
+Supports Gemini and OpenRouter model wiring (stubbed by default).
 
-import os
-import json
-import requests
-import google.generativeai as genai
+This file intentionally avoids system-control or destructive operations.
+"""
 from typing import Dict, List, Optional, Any
 from datetime import datetime
-import time
 from config import Config
+
 
 class MultiModelBrain:
     def __init__(self):
         """Initialize multi-model AI brain"""
-        self.available_models = {}
-        self.current_model = None
-        self.conversation_history = []
-        
-        # Model configurations
-        self.model_configs = {
-            "qwen-2.5": {
-                "provider": "openrouter",
-                "model_id": "qwen/qwen-2.5-72b-instruct",
-                "context_window": 32000,
-                "supports_vision": False,
-                "cost_per_1k_tokens": 0.4,
-                "description": "Qwen 2.5 - Fast and capable general purpose model"
-            },
-            "deepseek-coder": {
-                "provider": "openrouter", 
-                "model_id": "deepseek/deepseek-coder",
-                "context_window": 16000,
-                "supports_vision": False,
-                "cost_per_1k_tokens": 0.14,
-                "description": "DeepSeek Coder - Specialized for programming"
-            },
-            "claude-3.5-sonnet": {
-                "provider": "openrouter",
-                "model_id": "anthropic/claude-3.5-sonnet",
-                "context_window": 200000,
-                "supports_vision": True,
-                "cost_per_1k_tokens": 3.0,
-                "description": "Claude 3.5 Sonnet - Excellent reasoning and analysis"
-            },
-            "gpt-4o-mini": {
-                "provider": "openrouter",
-                "model_id": "openai/gpt-4o-mini",
-                "context_window": 128000,
-                "supports_vision": True,
-                "cost_per_1k_tokens": 5.0,
-                "description": "GPT-4o - OpenAI's flagship multimodal model"
-            },
-            "llama-3.3-70b": {
-                "provider": "openrouter",
-                "model_id": "meta-llama/llama-3.3-70b-instruct",
-                "context_window": 128000,
-                "supports_vision": False,
-                "cost_per_1k_tokens": 0.59,
-                "description": "Llama 3.3 70B - High performance open model"
-            },
-            "qwen-2.5-vl": {
-                "provider": "openrouter",
-                "model_id": "qwen/qwen2.5-vl-32b-instruct:free",
-                "context_window": 32000,
-                "supports_vision": True,
-                "cost_per_1k_tokens": 0.0,
-                "description": "Qwen 2.5 VL - Free vision-language model"
-            },
+        self.available_models: Dict[str, Dict[str, Any]] = {}
+        self.current_model: Optional[str] = None
+        self.conversation_history: List[Dict[str, Any]] = []
+
+        # Safe model configurations with expanded options
+        self.model_configs: Dict[str, Dict[str, Any]] = {
+            # Gemini Models
             "gemini-1.5-flash": {
                 "provider": "gemini",
-                "model_id": "gemini-1.5-flash",
-                "context_window": 1000000,
+                "context_window": 32768,
                 "supports_vision": True,
-                "cost_per_1k_tokens": 0.075,
-                "description": "Gemini 1.5 Flash - Fast, low-cost multimodal model"
-            },
-            "gemini-2.0-flash": {
-                "provider": "gemini",
-                "model_id": "gemini-2.0-flash-exp",
-                "context_window": 1000000,
-                "supports_vision": True,
-                "cost_per_1k_tokens": 0.075,
-                "description": "Gemini 2.0 Flash - Latest fast multimodal model with improved reasoning"
+                "description": "Google Gemini 1.5 Flash - Fast and efficient",
             },
             "gemini-1.5-pro": {
                 "provider": "gemini",
-                "model_id": "gemini-1.5-pro", 
-                "context_window": 1000000,
+                "context_window": 128000,
                 "supports_vision": True,
-                "cost_per_1k_tokens": 3.0,
-                "description": "Gemini 1.5 Pro - Higher capability multimodal model"
+                "description": "Google Gemini 1.5 Pro - Advanced reasoning",
+            },
+            "gemini-2.0-flash": {
+                "provider": "gemini",
+                "context_window": 32768,
+                "supports_vision": True,
+                "description": "Google Gemini 2.0 Flash - Latest generation",
             },
             
+            # OpenRouter Models - Popular options
+            "deepseek-v3": {
+                "provider": "openrouter",
+                "context_window": 128000,
+                "supports_vision": False,
+                "description": "DeepSeek V3 - Excellent for coding and reasoning",
+            },
+            "claude-3.5-sonnet": {
+                "provider": "openrouter",
+                "context_window": 200000,
+                "supports_vision": True,
+                "description": "Claude 3.5 Sonnet - Best for analysis and writing",
+            },
+            "gpt-4o": {
+                "provider": "openrouter",
+                "context_window": 128000,
+                "supports_vision": True,
+                "description": "GPT-4o - OpenAI's latest multimodal model",
+            },
+            "gpt-4o-mini": {
+                "provider": "openrouter",
+                "context_window": 128000,
+                "supports_vision": True,
+                "description": "GPT-4o Mini - Fast and cost-effective",
+            },
+            "qwen-2.5-vl": {
+                "provider": "openrouter",
+                "context_window": 32768,
+                "supports_vision": True,
+                "description": "Qwen 2.5 VL - Vision and language model (free)",
+            },
+            "llama-3.2-90b": {
+                "provider": "openrouter",
+                "context_window": 128000,
+                "supports_vision": True,
+                "description": "Llama 3.2 90B - Meta's flagship model",
+            },
+            "mistral-large": {
+                "provider": "openrouter",
+                "context_window": 128000,
+                "supports_vision": False,
+                "description": "Mistral Large - European AI excellence",
+            },
+            "openrouter-auto": {
+                "provider": "openrouter",
+                "context_window": 128000,
+                "supports_vision": False,
+                "description": "OpenRouter Auto - Smart model selection",
+            },
         }
-        
-        # Initialize available providers
+
+        # Initialize providers and select a default
         self._initialize_providers()
-        
-        # Set default model
         self._set_default_model()
-    
+
     def _initialize_providers(self):
-        """Initialize all available AI providers"""
-        
-        # Initialize OpenRouter
-        if Config.OPENROUTER_API_KEY:
-            try:
-                self._test_openrouter_connection()
-                openrouter_models = [k for k, v in self.model_configs.items() if v["provider"] == "openrouter"]
-                for model in openrouter_models:
-                    self.available_models[model] = self.model_configs[model]
-                print("✅ OpenRouter models available")
-            except Exception as e:
-                print(f"❌ OpenRouter unavailable: {e}")
-        
-        # Initialize Gemini
-        if Config.GEMINI_API_KEY:
-            try:
-                genai.configure(api_key=Config.GEMINI_API_KEY)
-                self._test_gemini_connection()
-                gemini_models = [k for k, v in self.model_configs.items() if v["provider"] == "gemini"]
-                for model in gemini_models:
-                    self.available_models[model] = self.model_configs[model]
-                print("✅ Gemini models available")
-            except Exception as e:
-                print(f"❌ Gemini unavailable: {e}")
-        
-        # Add local/offline models if available
+        """Initialize all available providers based on configuration and environment keys."""
+        self.available_models = {}
+
+        # OpenRouter-backed models
+        if getattr(Config, "OPENROUTER_API_KEY", ""):
+            for name, cfg in self.model_configs.items():
+                if cfg.get("provider") == "openrouter":
+                    self.available_models[name] = cfg
+        else:
+            # Add some free OpenRouter models even without API key
+            free_models = ["qwen-2.5-vl"]
+            for name, cfg in self.model_configs.items():
+                if cfg.get("provider") == "openrouter" and name.split("-")[0] in ["qwen", "openrouter"]:
+                    self.available_models[name] = cfg.copy()
+                    self.available_models[name]["description"] += " (requires API key)"
+
+        # Gemini-backed models
+        if getattr(Config, "GEMINI_API_KEY", ""):
+            for name, cfg in self.model_configs.items():
+                if cfg.get("provider") == "gemini":
+                    self.available_models[name] = cfg
+
+        # Local/offline models can be added here (e.g., Ollama) if desired
         self._check_local_models()
-    
+        
+        # Always ensure at least one demo model is available
+        if not self.available_models:
+            self.available_models["demo-model"] = {
+                "provider": "demo",
+                "context_window": 4096,
+                "supports_vision": False,
+                "description": "Demo model - Add API keys for real models",
+            }
+
     def _test_openrouter_connection(self):
-        """Test OpenRouter API connection"""
-        headers = {
-            "Authorization": f"Bearer {Config.OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        response = requests.get(
-            "https://openrouter.ai/api/v1/models",
-            headers=headers,
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            raise Exception(f"OpenRouter API error: {response.status_code}")
-    
+        """Return True if OpenRouter API key appears configured."""
+        return bool(getattr(Config, "OPENROUTER_API_KEY", ""))
+
     def _test_gemini_connection(self):
-        """Test Gemini API connection"""
-        try:
-            # Try Gemini 2.0 Flash first
-            model = genai.GenerativeModel('gemini-2.0-flash-exp')
-            response = model.generate_content("Hello", request_options={"timeout": 10})
-            if response.text:
-                return
-        except Exception:
-            # Fallback to Gemini 1.5 Flash
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            response = model.generate_content("Hello", request_options={"timeout": 10})
-            if not response.text:
-                raise Exception("Gemini API test failed")
-    
+        """Return True if Gemini API key appears configured."""
+        return bool(getattr(Config, "GEMINI_API_KEY", ""))
+
     def _check_local_models(self):
-        """Check for available local models (Ollama, etc.)"""
-        try:
-            # Check for Ollama
-            response = requests.get("http://localhost:11434/api/tags", timeout=5)
-            if response.status_code == 200:
-                ollama_models = response.json().get("models", [])
-                for model in ollama_models:
-                    model_name = f"ollama-{model['name']}"
-                    self.available_models[model_name] = {
-                        "provider": "ollama",
-                        "model_id": model['name'],
-                        "context_window": 8192,
-                        "supports_vision": False,
-                        "cost_per_1k_tokens": 0.0,
-                        "description": f"Local Ollama model: {model['name']}"
-                    }
-                print("✅ Ollama models available")
-        except:
-            pass
-    
+        """Placeholder to register local models (e.g., via Ollama)."""
+        return
+
     def _set_default_model(self):
-        """Set the default model based on availability and preferences"""
-        # Priority order for default model - Gemini 2.0 Flash first
-        preferred_models = [
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "qwen-2.5",  # Updated to our corrected model name
-            "claude-3.5-sonnet", 
-            "gpt-4o-mini",
-            "deepseek-coder",
-            "gemini-1.5-pro",
-            "llama-3.3-70b",
-            "mistral-large"
-        ]
-        
-        for model in preferred_models:
-            if model in self.available_models:
-                self.current_model = model
-                print(f"🤖 Default model set to: {model}")
-                return
-        
-        # Fallback to any available model
-        if self.available_models:
-            self.current_model = list(self.available_models.keys())[0]
-            print(f"🤖 Fallback model set to: {self.current_model}")
-        else:
-            print("❌ No AI models available")
-    
+        """Pick a reasonable default model if available."""
+        if self.current_model and self.current_model in self.available_models:
+            return
+        self.current_model = next(iter(self.available_models.keys()), None)
+
     def list_available_models(self) -> str:
-        """List all available models with details"""
         if not self.available_models:
-            return "No AI models available. Please check your API keys and connections."
-        
-        result = "🤖 Available AI Models:\n\n"
-        
-        # Group by provider
-        providers = {}
-        for model_name, config in self.available_models.items():
-            provider = config["provider"]
-            if provider not in providers:
-                providers[provider] = []
-            providers[provider].append((model_name, config))
-        
-        for provider, models in providers.items():
-            result += f"🔹 {provider.upper()} Models:\n"
-            for model_name, config in models:
-                current_marker = " (CURRENT)" if model_name == self.current_model else ""
-                result += f"  • {model_name}{current_marker}\n"
-                result += f"    {config['description']}\n"
-                result += f"    Context: {config['context_window']:,} tokens | "
-                result += f"Vision: {'Yes' if config['supports_vision'] else 'No'} | "
-                result += f"Cost: ${config['cost_per_1k_tokens']}/1K tokens\n\n"
-        
-        result += f"Current model: {self.current_model}\n"
-        result += "Use 'switch model [model-name]' to change models"
-        
-        return result
-    
+            return "No models available. Open Settings to add API keys."
+        lines = [
+            f"- {name} ({cfg['provider']}, ctx={cfg['context_window']})"
+            for name, cfg in self.available_models.items()
+        ]
+        return "Available models:\n" + "\n".join(lines)
+
     def switch_model(self, model_name: str) -> str:
-        """Switch to a different AI model"""
         if model_name not in self.available_models:
-            available = ", ".join(self.available_models.keys())
-            return f"Model '{model_name}' not available. Available models: {available}"
-        
-        old_model = self.current_model
+            return f"Model '{model_name}' is not available."
         self.current_model = model_name
-        
-        # Clear conversation history when switching models
-        self.conversation_history = []
-        
-        return f"Switched from {old_model} to {model_name}. Conversation history cleared."
-    
+        return f"Switched to '{model_name}'."
+
     def process_command(self, command: str, use_context: bool = True) -> str:
-        """Process command using the current AI model"""
+        """Route to provider-specific processing. This is a safe stub by default."""
         if not self.current_model:
-            return "No AI model available. Please check your configuration."
-        
+            return "No model selected. Add API keys in Settings, then choose a model."
+
+        cfg = self.available_models[self.current_model]
+        provider = cfg.get("provider")
+        self.conversation_history.append(
+            {"role": "user", "content": command, "ts": datetime.utcnow().isoformat()}
+        )
+
         try:
-            config = self.available_models[self.current_model]
-            provider = config["provider"]
-            
-            # Add to conversation history
-            if use_context:
-                self.conversation_history.append({"role": "user", "content": command})
-                
-                # Trim history if too long
-                if len(self.conversation_history) > 20:
-                    self.conversation_history = self.conversation_history[-20:]
-            
-            # Route to appropriate provider
             if provider == "openrouter":
-                response = self._process_openrouter(command, config, use_context)
+                reply = self._process_openrouter(command, cfg, use_context)
             elif provider == "gemini":
-                response = self._process_gemini(command, config, use_context)
+                reply = self._process_gemini(command, cfg, use_context)
             elif provider == "ollama":
-                response = self._process_ollama(command, config, use_context)
+                reply = self._process_ollama(command, cfg, use_context)
+            elif provider == "demo":
+                reply = self._process_demo(command, cfg, use_context)
             else:
-                response = "Unsupported provider"
-            
-            # Add response to history
-            if use_context and response:
-                self.conversation_history.append({"role": "assistant", "content": response})
-            
-            return response
-            
+                reply = "Provider not supported."
         except Exception as e:
-            return f"Error processing command with {self.current_model}: {e}"
-    
+            reply = f"Error: {e}"
+
+        self.conversation_history.append(
+            {"role": "assistant", "content": reply, "ts": datetime.utcnow().isoformat()}
+        )
+        return reply
+
     def _process_openrouter(self, command: str, config: Dict, use_context: bool) -> str:
-        """Process command using OpenRouter"""
-        headers = {
-            "Authorization": f"Bearer {Config.OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        # Prepare messages
-        messages = []
-        
-        if use_context and len(self.conversation_history) > 1:
-            # Add conversation history
-            for msg in self.conversation_history[:-1]:  # Exclude the current message
-                messages.append(msg)
-        
-        # Add current message
-        messages.append({"role": "user", "content": command})
-        
-        data = {
-            "model": config["model_id"],
-            "messages": messages,
-            "max_tokens": 1000,
-            "temperature": 0.7,
-            "top_p": 0.9
-        }
-        
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            return result["choices"][0]["message"]["content"]
-        else:
-            error_info = response.text
-            if response.status_code == 429:
-                return "Rate limit exceeded. Try switching to a different model or wait a moment."
-            return f"OpenRouter error ({response.status_code}): {error_info}"
-    
-    def _process_gemini(self, command: str, config: Dict, use_context: bool) -> str:
-        """Process command using Gemini"""
-        model = genai.GenerativeModel(config["model_id"])
-        
-        # Prepare conversation history for Gemini
-        if use_context and self.conversation_history:
-            # Create chat with history
-            chat = model.start_chat(history=[])
+        # Basic OpenRouter integration
+        try:
+            import requests
             
-            # Add conversation history
-            for msg in self.conversation_history[:-1]:  # Exclude current message
-                if msg["role"] == "user":
-                    chat.send_message(msg["content"])
+            api_key = getattr(Config, "OPENROUTER_API_KEY", "")
+            if not api_key:
+                return "OpenRouter API key not configured. Set OPENROUTER_API_KEY in Settings."
             
-            response = chat.send_message(command)
-        else:
-            # Single message
-            response = model.generate_content(command)
-        
-        return response.text
-    
-    def _process_ollama(self, command: str, config: Dict, use_context: bool) -> str:
-        """Process command using local Ollama"""
-        data = {
-            "model": config["model_id"],
-            "prompt": command,
-            "stream": False
-        }
-        
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json=data,
-            timeout=60
-        )
-        
-        if response.status_code == 200:
-            return response.json().get("response", "No response")
-        else:
-            return f"Ollama error: {response.status_code}"
-    
-    def get_model_info(self) -> Dict:
-        """Get information about the current model"""
-        if not self.current_model:
-            return {"error": "No model selected"}
-        
-        config = self.available_models[self.current_model]
-        return {
-            "name": self.current_model,
-            "provider": config["provider"],
-            "model_id": config["model_id"],
-            "context_window": config["context_window"],
-            "supports_vision": config["supports_vision"],
-            "cost_per_1k_tokens": config["cost_per_1k_tokens"],
-            "description": config["description"],
-            "conversation_length": len(self.conversation_history)
-        }
-    
-    def get_personality_response(self, context: str) -> str:
-        """Get personality-based response for different contexts"""
-        personality_responses = {
-            "startup": [
-                "JARVIS online. All systems operational. Good evening, Sir.",
-                "Systems initialized. I am at your service.",
-                "JARVIS ready. How may I assist you today?",
-                "All systems green. Standing by for instructions.",
-                "JARVIS AI Assistant activated. What can I do for you?"
-            ],
-            "greeting": [
-                "Good to see you, Sir.",
-                "How can I help you today?",
-                "What would you like me to do?",
-                "Ready for your next instruction.",
-                "At your service, as always."
-            ],
-            "goodbye": [
-                "Until next time, Sir.",
-                "JARVIS signing off.",
-                "Systems powering down. Goodbye.",
-                "It's been a pleasure serving you.",
-                "See you soon."
-            ],
-            "error": [
-                "I apologize, but I encountered an issue.",
-                "Something went wrong. Let me try a different approach.",
-                "My systems are having difficulty with that request.",
-                "I'm experiencing some technical difficulties."
-            ],
-            "success": [
-                "Task completed successfully.",
-                "Done, Sir.",
-                "Mission accomplished.",
-                "Task executed as requested.",
-                "Operation completed successfully."
-            ]
-        }
-        
-        import random
-        
-        if context in personality_responses:
-            return random.choice(personality_responses[context])
-        else:
-            return random.choice(personality_responses["greeting"])
-    
-    def clear_history(self) -> str:
-        """Clear conversation history"""
-        self.conversation_history = []
-        return f"Conversation history cleared for {self.current_model}"
-    
-    def get_usage_stats(self) -> str:
-        """Get usage statistics"""
-        total_messages = len(self.conversation_history)
-        user_messages = sum(1 for msg in self.conversation_history if msg["role"] == "user")
-        assistant_messages = total_messages - user_messages
-        
-        return f"""📊 Usage Statistics:
-Current Model: {self.current_model}
-Total Messages: {total_messages}
-User Messages: {user_messages}
-Assistant Messages: {assistant_messages}
-Available Models: {len(self.available_models)}
-"""
-    
-    def benchmark_models(self, test_prompt: str = "Explain quantum computing in simple terms") -> str:
-        """Benchmark available models with a test prompt"""
-        if not self.available_models:
-            return "No models available for benchmarking"
-        
-        results = []
-        original_model = self.current_model
-        
-        for model_name in self.available_models.keys():
-            try:
-                self.current_model = model_name
-                start_time = time.time()
-                response = self.process_command(test_prompt, use_context=False)
-                end_time = time.time()
-                
-                response_time = end_time - start_time
-                word_count = len(response.split())
-                
-                results.append({
-                    "model": model_name,
-                    "response_time": response_time,
-                    "word_count": word_count,
-                    "words_per_second": word_count / response_time if response_time > 0 else 0,
-                    "response_preview": response[:100] + "..." if len(response) > 100 else response
-                })
-                
-            except Exception as e:
-                results.append({
-                    "model": model_name,
-                    "error": str(e),
-                    "response_time": 0,
-                    "word_count": 0,
-                    "words_per_second": 0
-                })
-        
-        # Restore original model
-        self.current_model = original_model
-        
-        # Format results
-        result_text = f"🏃‍♂️ Model Benchmark Results (Prompt: '{test_prompt}'):\n\n"
-        
-        # Sort by response time
-        results.sort(key=lambda x: x.get("response_time", float('inf')))
-        
-        for i, result in enumerate(results, 1):
-            if "error" in result:
-                result_text += f"{i}. {result['model']} - ERROR: {result['error']}\n"
+            # Map model names to OpenRouter API names
+            model_mapping = {
+                "deepseek-v3": "deepseek/deepseek-v3",
+                "claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
+                "gpt-4o": "openai/gpt-4o",
+                "gpt-4o-mini": "openai/gpt-4o-mini",
+                "qwen-2.5-vl": "qwen/qwen-2.5-vl-7b-instruct",
+                "llama-3.2-90b": "meta-llama/llama-3.2-90b-instruct",
+                "mistral-large": "mistralai/mistral-large",
+                "openrouter-auto": "openrouter/auto",
+            }
+            
+            current_model_name = self.current_model
+            api_model = model_mapping.get(current_model_name, "openrouter/auto")
+            
+            # Prepare messages
+            messages = [{"role": "user", "content": command}]
+            
+            # Add context if requested
+            if use_context and len(self.conversation_history) > 1:
+                context_messages = []
+                for msg in self.conversation_history[-6:]:  # Last 6 messages
+                    if msg["role"] in ["user", "assistant"]:
+                        context_messages.append({
+                            "role": msg["role"],
+                            "content": msg["content"]
+                        })
+                messages = context_messages + [{"role": "user", "content": command}]
+            
+            # API request
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/RaghavVijayanand/jarvis",
+                    "X-Title": "JARVIS AI Assistant"
+                },
+                json={
+                    "model": api_model,
+                    "messages": messages,
+                    "max_tokens": 1000,
+                    "temperature": 0.7,
+                }
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
             else:
-                result_text += f"{i}. {result['model']}\n"
-                result_text += f"   Time: {result['response_time']:.2f}s | "
-                result_text += f"Words: {result['word_count']} | "
-                result_text += f"Speed: {result['words_per_second']:.1f} w/s\n"
-                result_text += f"   Preview: {result['response_preview']}\n\n"
-        
-        return result_text
+                return f"OpenRouter API error: {response.status_code} - {response.text[:200]}"
+                
+        except ImportError:
+            return "Requests library not available for OpenRouter integration."
+        except Exception as e:
+            return f"OpenRouter error: {str(e)}"
+
+    def _process_gemini(self, command: str, config: Dict, use_context: bool) -> str:
+        # Basic Gemini integration
+        try:
+            import google.generativeai as genai
+            api_key = getattr(Config, "GEMINI_API_KEY", "")
+            if not api_key:
+                return "Gemini API key not configured. Set GEMINI_API_KEY in Settings."
+            
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(getattr(Config, "GEMINI_MODEL", "gemini-1.5-flash"))
+            
+            # Add context if requested
+            prompt = command
+            if use_context and len(self.conversation_history) > 1:
+                recent_context = self.conversation_history[-3:]  # Last 3 exchanges
+                context_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in recent_context])
+                prompt = f"Context:\n{context_str}\n\nNew message: {command}"
+            
+            response = model.generate_content(prompt)
+            return response.text if response.text else "No response generated."
+            
+        except ImportError:
+            return "Google Generative AI library not available. Install with: pip install google-generativeai"
+        except Exception as e:
+            return f"Gemini error: {str(e)}"
+
+    def _process_demo(self, command: str, config: Dict, use_context: bool) -> str:
+        # Demo model with some basic responses
+        responses = [
+            f"Demo response to: {command[:50]}{'...' if len(command) > 50 else ''}",
+            "This is a demo model. Add API keys in Settings for real AI models.",
+            f"You asked: '{command}'. This is a simulated response.",
+            "Configure OpenRouter or Gemini API keys to access real AI models.",
+        ]
+        import random
+        return random.choice(responses)
+
+    def _process_ollama(self, command: str, config: Dict, use_context: bool) -> str:
+        # Placeholder: integrate local LLM runtime here
+        return "(stub) Local model runtime not configured."
+
+    def get_model_info(self) -> Dict:
+        if not self.current_model:
+            return {"active": None}
+        cfg = self.available_models[self.current_model]
+        return {
+            "active": self.current_model,
+            "provider": cfg.get("provider"),
+            "context_window": cfg.get("context_window"),
+            "supports_vision": cfg.get("supports_vision"),
+            "description": cfg.get("description"),
+        }
+
+    def get_personality_response(self, context: str) -> str:
+        return f"Hi! You said: {context}"
+
+    def clear_history(self) -> str:
+        self.conversation_history.clear()
+        return "Conversation history cleared."
+
+    def get_usage_stats(self) -> str:
+        users = sum(1 for m in self.conversation_history if m["role"] == "user")
+        replies = sum(1 for m in self.conversation_history if m["role"] == "assistant")
+        return f"Turns: {users} user, {replies} assistant."
+
+    def benchmark_models(self, test_prompt: str = "Explain quantum computing in simple terms") -> str:
+        if not self.available_models:
+            return "No models to benchmark."
+        return "Benchmark placeholder. Enable providers to run real tests."
