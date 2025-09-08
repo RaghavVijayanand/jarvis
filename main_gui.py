@@ -26,15 +26,23 @@ from skills.file_manager import FileManagerSkill
 from skills.web_search import WebSearchSkill
 from skills.system_monitor import SystemMonitor
 
+# Import enhanced JARVIS capabilities
+from skills.automation import AutomationSkill
+from skills.app_control import ApplicationControl
+from skills.command_processor import CommandProcessor
+from skills.task_scheduler import TaskScheduler
+from skills.screen_automation import ScreenAutomationSkill
+
 class JarvisWorker(QThread):
     """Fast worker thread for processing commands"""
     response_ready = Signal(str)
     error_occurred = Signal(str)
     status_update = Signal(str)
     
-    def __init__(self, brain, skills, voice_engine=None):
+    def __init__(self, jarvis_instance, skills, voice_engine=None):
         super().__init__()
-        self.brain = brain
+        self.jarvis = jarvis_instance  # Use the main JARVIS instance
+        self.brain = jarvis_instance.brain  # Keep for backward compatibility  
         self.skills = skills
         self.voice_engine = voice_engine
         self.current_command = ""
@@ -48,88 +56,16 @@ class JarvisWorker(QThread):
         try:
             self.status_update.emit("Processing...")
             
-            # Check for skill-specific commands first
-            command_lower = self.current_command.lower()
-            response = ""
+            # Use the main JARVIS process_command method with all improvements
+            response = self.jarvis.process_command(self.current_command, use_voice=self.voice_enabled)
             
-            if any(word in command_lower for word in ['weather', 'temperature', 'forecast']):
-                try:
-                    response = self.skills['weather'].get_weather(self.current_command)
-                    # If weather service fails, provide a helpful message
-                    if "Unable to fetch weather data" in response:
-                        response += "\n\nTip: You can also try asking for weather in a specific city like 'weather in London'"
-                except Exception as e:
-                    response = f"Weather service unavailable: {e}"
-                    
-            elif any(word in command_lower for word in ['cpu', 'memory', 'system', 'usage', 'performance']):
-                try:
-                    response = self.skills['system_monitor'].get_system_info()
-                except Exception as e:
-                    response = f"System monitor error: {e}"
-                    
-            elif any(word in command_lower for word in ['file', 'folder', 'directory', 'create', 'delete']):
-                try:
-                    response = self.skills['file_manager'].handle_file_command(self.current_command)
-                except Exception as e:
-                    response = f"File operation error: {e}"
-                    
-            elif any(word in command_lower for word in ['search', 'google', 'find', 'web']):
-                try:
-                    response = self.skills['web_search'].search_web(self.current_command, llm_brain=self.brain)
-                except Exception as e:
-                    response = f"Web search error: {e}"
-                    
-            elif any(word in command_lower for word in ['joke', 'funny', 'humor']):
-                try:
-                    response = self.skills['utility'].tell_joke()
-                except Exception as e:
-                    response = f"Joke service error: {e}"
-                    
-            elif any(word in command_lower for word in ['calculate', 'math', 'compute']) or any(op in self.current_command for op in ['+', '-', '*', '/', '=']):
-                try:
-                    response = self.skills['utility'].calculate(self.current_command)
-                except Exception as e:
-                    response = f"Calculator error: {e}"
-                    
-            elif any(word in command_lower for word in ['open', 'launch', 'start']) and 'calculator' in command_lower:
-                # Handle calculator opening
-                try:
-                    import subprocess
-                    subprocess.Popen('calc.exe')
-                    response = "Calculator opened successfully!"
-                except Exception as e:
-                    response = f"Could not open calculator: {str(e)}"
+            if response:
+                self.response_ready.emit(response)
             else:
-                # Use the AI brain for general queries
-                try:
-                    response = self.brain.process_command(self.current_command)
-                    # Check if it's a stub response
-                    if not response or "stub" in response.lower() or "not configured" in response.lower():
-                        response = f"I received your message: '{self.current_command}'. The AI model needs to be configured with API keys. Please go to Settings to add your API keys."
-                except Exception as e:
-                    response = f"AI processing error: {e}"
+                self.response_ready.emit("I completed the task, but didn't receive a specific response.")
             
-            # Ensure we always have a response
-            if not response or response.strip() == "":
-                response = f"I'm not sure how to respond to: '{self.current_command}'. Try asking about weather, system info, calculations, or jokes."
-            
-            # Voice output if enabled
-            if self.voice_enabled and self.voice_engine:
-                try:
-                    # Shorten response for voice if it's too long
-                    voice_response = response
-                    if len(response) > 300:
-                        # Use first sentence or first 200 chars for voice
-                        sentences = response.split('. ')
-                        voice_response = sentences[0] + "." if sentences else response[:200] + "..."
-                    
-                    self.voice_engine.speak(voice_response)
-                except Exception as e:
-                    print(f"Voice output error: {e}")
-            
-            self.response_ready.emit(response)
             self.status_update.emit("Ready")
-            
+                
         except Exception as e:
             error_msg = f"Processing error: {str(e)}"
             self.error_occurred.emit(error_msg)
@@ -476,36 +412,19 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("JARVIS AI Assistant - Full Featured")
         self.setGeometry(100, 100, 1200, 800)
         
-        # Initialize all components
-        self.brain = MultiModelBrain()
-        self.voice_engine = VoiceEngine()
+        # Initialize the main JARVIS system instead of individual components
+        from jarvis import JARVIS
+        self.jarvis = JARVIS()
+        
+        # Get references to the components for backward compatibility
+        self.brain = self.jarvis.brain
+        self.voice_engine = self.jarvis.voice_engine
+        self.skills = self.jarvis.skills
         self.voice_chat_active = False
         self.voice_chat_worker = None
         
-        # Initialize all skills for full CLI functionality
-        self.skills = {
-            'weather': WeatherSkill(),
-            'utility': UtilitySkill(),
-            'file_manager': FileManagerSkill(),
-            'web_search': WebSearchSkill(),
-            'system_monitor': SystemMonitor(),
-        }
-        
-        # Try to initialize advanced skills
-        try:
-            from skills.automation import AutomationSkill
-            self.skills['automation'] = AutomationSkill()
-        except Exception as e:
-            print(f"Automation skill not available: {e}")
-            
-        try:
-            from skills.app_control import ApplicationControl
-            self.skills['app_control'] = ApplicationControl()
-        except Exception as e:
-            print(f"App control skill not available: {e}")
-        
-        # Worker thread for fast processing
-        self.worker = JarvisWorker(self.brain, self.skills, self.voice_engine)
+        # Worker thread for fast processing - updated to use JARVIS
+        self.worker = JarvisWorker(self.jarvis, self.skills, self.voice_engine)
         self.worker.response_ready.connect(self.on_response_ready)
         self.worker.error_occurred.connect(self.on_error)
         self.worker.status_update.connect(self.on_status_update)
@@ -545,10 +464,34 @@ class MainWindow(QMainWindow):
         # System tab
         self.setup_system_tab()
         
-        # Status bar
+        # Status bar with enhanced information
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
-        self.statusBar.showMessage("Ready")
+        
+        # Create status bar widgets
+        self.status_label = QLabel("Ready")
+        self.statusBar.addWidget(self.status_label)
+        
+        # Add separator
+        self.statusBar.addPermanentWidget(QLabel("|"))
+        
+        # Show JARVIS brain type
+        brain_type = getattr(self.jarvis, 'brain_type', 'native')
+        self.brain_status = QLabel(f"Brain: {brain_type}")
+        self.statusBar.addPermanentWidget(self.brain_status)
+        
+        # Show available capabilities
+        capabilities = []
+        if hasattr(self.jarvis, 'screen_automation') and self.jarvis.screen_automation:
+            capabilities.append("Vision")
+        if hasattr(self.jarvis, 'automation_skill') and self.jarvis.automation_skill:
+            capabilities.append("Automation")
+        if hasattr(self.jarvis, 'app_control') and self.jarvis.app_control:
+            capabilities.append("AppControl")
+        
+        if capabilities:
+            self.capabilities_status = QLabel(f"Capabilities: {', '.join(capabilities)}")
+            self.statusBar.addPermanentWidget(self.capabilities_status)
     
     def create_control_bar(self):
         """Create the top control bar"""
@@ -597,6 +540,19 @@ class MainWindow(QMainWindow):
         self.btn_settings.clicked.connect(self.open_settings)
         layout.addWidget(self.btn_settings)
         
+        # Quick automation buttons
+        layout.addWidget(QLabel("|"))  # Separator
+        
+        self.btn_quick_screenshot = QPushButton("📸 Screenshot")
+        self.btn_quick_screenshot.clicked.connect(self.take_screenshot_and_analyze)
+        self.btn_quick_screenshot.setToolTip("Take screenshot and analyze")
+        layout.addWidget(self.btn_quick_screenshot)
+        
+        self.btn_quick_apps = QPushButton("🚀 Apps")
+        self.btn_quick_apps.clicked.connect(self.discover_applications)
+        self.btn_quick_apps.setToolTip("Discover available applications")
+        layout.addWidget(self.btn_quick_apps)
+        
         return control_frame
     
     def setup_chat_tab(self):
@@ -614,7 +570,7 @@ class MainWindow(QMainWindow):
         input_layout = QHBoxLayout()
         
         self.input = QLineEdit()
-        self.input.setPlaceholderText("Type your command... (Try: 'weather', 'joke', 'system info', 'search python')")
+        self.input.setPlaceholderText("Type your command... (Try: 'weather', 'take screenshot', 'open Word and create document', 'search python')")
         self.input.returnPressed.connect(self.on_send)
         input_layout.addWidget(self.input, 1)
         
@@ -701,6 +657,14 @@ class MainWindow(QMainWindow):
         
         self.tab_widget.addTab(system_widget, "System")
         
+        # Automation Tab
+        automation_widget = self.create_automation_tab()
+        self.tab_widget.addTab(automation_widget, "Automation")
+        
+        # Visual Tasks Tab
+        visual_tasks_widget = self.create_visual_tasks_tab()
+        self.tab_widget.addTab(visual_tasks_widget, "Visual Tasks")
+        
         # Auto-refresh system info
         self.refresh_system_info()
     
@@ -731,6 +695,29 @@ class MainWindow(QMainWindow):
         skills_test_action = QAction("Test All Skills", self)
         skills_test_action.triggered.connect(self.test_all_skills)
         tools_menu.addAction(skills_test_action)
+        
+        tools_menu.addSeparator()
+        
+        screenshot_action = QAction("Quick Screenshot Analysis", self)
+        screenshot_action.triggered.connect(self.take_screenshot_and_analyze)
+        tools_menu.addAction(screenshot_action)
+        
+        # Automation menu
+        automation_menu = menubar.addMenu("Automation")
+        
+        visual_task_action = QAction("Execute Visual Task...", self)
+        visual_task_action.triggered.connect(lambda: self.tab_widget.setCurrentIndex(3))  # Switch to automation tab
+        automation_menu.addAction(visual_task_action)
+        
+        complex_task_action = QAction("Execute Complex Task...", self)
+        complex_task_action.triggered.connect(lambda: self.tab_widget.setCurrentIndex(4))  # Switch to visual tasks tab
+        automation_menu.addAction(complex_task_action)
+        
+        automation_menu.addSeparator()
+        
+        discover_apps_action = QAction("Discover Applications", self)
+        discover_apps_action.triggered.connect(self.discover_applications)
+        automation_menu.addAction(discover_apps_action)
         
         # Help menu
         help_menu = menubar.addMenu("Help")
@@ -770,7 +757,7 @@ class MainWindow(QMainWindow):
             self.worker.terminate()
             self.worker.wait(1000)  # Wait up to 1 second
         
-        self.worker = JarvisWorker(self.brain, self.skills, self.voice_engine)
+        self.worker = JarvisWorker(self.jarvis, self.skills, self.voice_engine)
         self.worker.response_ready.connect(self.on_response_ready)
         self.worker.error_occurred.connect(self.on_error)
         self.worker.status_update.connect(self.on_status_update)
@@ -1019,6 +1006,274 @@ Built with PySide6 and Python
             self.worker.wait(1000)
         
         event.accept()
+
+    def create_automation_tab(self):
+        """Create the automation control tab"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        # Automation controls
+        automation_group = QWidget()
+        automation_layout = QVBoxLayout(automation_group)
+        
+        # Screen automation section
+        screen_section = QLabel("Screen Automation & AI Vision")
+        screen_section.setFont(QFont("Arial", 12, QFont.Bold))
+        automation_layout.addWidget(screen_section)
+        
+        # Screenshot and analysis
+        screenshot_layout = QHBoxLayout()
+        btn_screenshot = QPushButton("Take Screenshot")
+        btn_screenshot.clicked.connect(self.take_screenshot_and_analyze)
+        screenshot_layout.addWidget(btn_screenshot)
+        
+        btn_analyze_screen = QPushButton("Analyze Current Screen")
+        btn_analyze_screen.clicked.connect(self.analyze_current_screen)
+        screenshot_layout.addWidget(btn_analyze_screen)
+        
+        automation_layout.addLayout(screenshot_layout)
+        
+        # Visual task input
+        task_input_layout = QHBoxLayout()
+        self.visual_task_input = QLineEdit()
+        self.visual_task_input.setPlaceholderText("Describe what you want me to do on screen (e.g., 'click the save button')")
+        task_input_layout.addWidget(self.visual_task_input)
+        
+        btn_execute_visual = QPushButton("Execute Visual Task")
+        btn_execute_visual.clicked.connect(self.execute_visual_task)
+        task_input_layout.addWidget(btn_execute_visual)
+        
+        automation_layout.addLayout(task_input_layout)
+        
+        # App control section
+        app_section = QLabel("Application Control")
+        app_section.setFont(QFont("Arial", 12, QFont.Bold))
+        automation_layout.addWidget(app_section)
+        
+        app_control_layout = QHBoxLayout()
+        btn_discover_apps = QPushButton("Discover Apps")
+        btn_discover_apps.clicked.connect(self.discover_applications)
+        app_control_layout.addWidget(btn_discover_apps)
+        
+        btn_launch_app = QPushButton("Launch Application")
+        btn_launch_app.clicked.connect(self.launch_application_dialog)
+        app_control_layout.addWidget(btn_launch_app)
+        
+        automation_layout.addLayout(app_control_layout)
+        
+        layout.addWidget(automation_group)
+        
+        # Automation output/log area
+        self.automation_log = QTextEdit()
+        self.automation_log.setPlaceholderText("Automation activities and results will appear here...")
+        self.automation_log.setMaximumHeight(200)
+        layout.addWidget(self.automation_log)
+        
+        return widget
+
+    def create_visual_tasks_tab(self):
+        """Create the visual tasks and AI orchestration tab"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        # Task orchestration controls
+        task_group = QWidget()
+        task_layout = QVBoxLayout(task_group)
+        
+        # Multi-step task section
+        multistep_section = QLabel("Multi-Step Task Orchestration")
+        multistep_section.setFont(QFont("Arial", 12, QFont.Bold))
+        task_layout.addWidget(multistep_section)
+        
+        # Complex task input
+        complex_task_layout = QVBoxLayout()
+        self.complex_task_input = QTextEdit()
+        self.complex_task_input.setPlaceholderText("Describe a complex task that requires multiple steps (e.g., 'open Word, create a document with today's date, save it as daily_report.docx')")
+        self.complex_task_input.setMaximumHeight(100)
+        complex_task_layout.addWidget(self.complex_task_input)
+        
+        complex_task_buttons = QHBoxLayout()
+        btn_execute_complex = QPushButton("Execute Complex Task")
+        btn_execute_complex.clicked.connect(self.execute_complex_task)
+        complex_task_buttons.addWidget(btn_execute_complex)
+        
+        btn_plan_task = QPushButton("Plan Task Steps")
+        btn_plan_task.clicked.connect(self.plan_task_steps)
+        complex_task_buttons.addWidget(btn_plan_task)
+        
+        complex_task_layout.addLayout(complex_task_buttons)
+        task_layout.addLayout(complex_task_layout)
+        
+        # Task queue and monitoring
+        queue_section = QLabel("Task Queue & Monitoring")
+        queue_section.setFont(QFont("Arial", 12, QFont.Bold))
+        task_layout.addWidget(queue_section)
+        
+        # Task queue list
+        self.task_queue_list = QListWidget()
+        self.task_queue_list.setMaximumHeight(150)
+        task_layout.addWidget(self.task_queue_list)
+        
+        queue_controls = QHBoxLayout()
+        btn_pause_tasks = QPushButton("Pause Queue")
+        btn_pause_tasks.clicked.connect(self.pause_task_queue)
+        queue_controls.addWidget(btn_pause_tasks)
+        
+        btn_resume_tasks = QPushButton("Resume Queue")
+        btn_resume_tasks.clicked.connect(self.resume_task_queue)
+        queue_controls.addWidget(btn_resume_tasks)
+        
+        btn_clear_queue = QPushButton("Clear Queue")
+        btn_clear_queue.clicked.connect(self.clear_task_queue)
+        queue_controls.addWidget(btn_clear_queue)
+        
+        task_layout.addLayout(queue_controls)
+        
+        layout.addWidget(task_group)
+        
+        # Task execution log
+        self.task_execution_log = QTextEdit()
+        self.task_execution_log.setPlaceholderText("Task execution details and progress will appear here...")
+        layout.addWidget(self.task_execution_log)
+        
+        return widget
+
+    # Automation and Visual Task Methods
+    def take_screenshot_and_analyze(self):
+        """Take screenshot and analyze with AI"""
+        try:
+            if hasattr(self.jarvis, 'screen_automation') and self.jarvis.screen_automation:
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Taking screenshot for analysis...")
+                
+                # Use JARVIS screen automation
+                response = self.jarvis.process_command("take a screenshot and tell me what you see")
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Analysis: {response}")
+            else:
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Screen automation not available")
+        except Exception as e:
+            self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
+
+    def analyze_current_screen(self):
+        """Analyze current screen without taking new screenshot"""
+        try:
+            if hasattr(self.jarvis, 'screen_automation') and self.jarvis.screen_automation:
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Analyzing current screen...")
+                
+                response = self.jarvis.process_command("analyze the current screen and describe what you see")
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Analysis: {response}")
+            else:
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Screen automation not available")
+        except Exception as e:
+            self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
+
+    def execute_visual_task(self):
+        """Execute a visual task based on user input"""
+        task_description = self.visual_task_input.text().strip()
+        if not task_description:
+            self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Please enter a task description")
+            return
+        
+        try:
+            self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Executing visual task: {task_description}")
+            
+            # Process the visual task through JARVIS
+            response = self.jarvis.process_command(task_description)
+            self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Task result: {response}")
+            self.visual_task_input.clear()
+        except Exception as e:
+            self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Task execution error: {str(e)}")
+
+    def discover_applications(self):
+        """Discover available applications"""
+        try:
+            if hasattr(self.jarvis, 'app_control') and self.jarvis.app_control:
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Discovering applications...")
+                
+                response = self.jarvis.process_command("discover available applications")
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {response}")
+            else:
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Application control not available")
+        except Exception as e:
+            self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
+
+    def launch_application_dialog(self):
+        """Show dialog to launch an application"""
+        from PySide6.QtWidgets import QInputDialog
+        
+        app_name, ok = QInputDialog.getText(self, 'Launch Application', 'Enter application name to launch:')
+        if ok and app_name:
+            try:
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Launching {app_name}...")
+                
+                response = self.jarvis.process_command(f"launch {app_name}")
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {response}")
+            except Exception as e:
+                self.automation_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Launch error: {str(e)}")
+
+    def execute_complex_task(self):
+        """Execute a complex multi-step task"""
+        task_description = self.complex_task_input.toPlainText().strip()
+        if not task_description:
+            self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Please enter a task description")
+            return
+        
+        try:
+            self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Starting complex task: {task_description}")
+            
+            # Add to task queue
+            self.task_queue_list.addItem(f"Complex Task: {task_description[:50]}...")
+            
+            # Process through JARVIS - it will handle the orchestration
+            response = self.jarvis.process_command(task_description)
+            self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Task completed: {response}")
+            
+            self.complex_task_input.clear()
+        except Exception as e:
+            self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Task execution error: {str(e)}")
+
+    def plan_task_steps(self):
+        """Plan the steps for a complex task without executing"""
+        task_description = self.complex_task_input.toPlainText().strip()
+        if not task_description:
+            self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Please enter a task description")
+            return
+        
+        try:
+            self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Planning steps for: {task_description}")
+            
+            # Ask JARVIS to plan without executing
+            planning_prompt = f"Plan the steps needed to complete this task, but don't execute them yet: {task_description}"
+            response = self.jarvis.process_command(planning_prompt)
+            self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Execution plan: {response}")
+        except Exception as e:
+            self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Planning error: {str(e)}")
+
+    def pause_task_queue(self):
+        """Pause the task execution queue"""
+        try:
+            if hasattr(self.jarvis, 'task_scheduler') and self.jarvis.task_scheduler:
+                self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Pausing task queue...")
+                # Implementation depends on task scheduler capabilities
+            else:
+                self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Task scheduler not available")
+        except Exception as e:
+            self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
+
+    def resume_task_queue(self):
+        """Resume the task execution queue"""
+        try:
+            if hasattr(self.jarvis, 'task_scheduler') and self.jarvis.task_scheduler:
+                self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Resuming task queue...")
+                # Implementation depends on task scheduler capabilities
+            else:
+                self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Task scheduler not available")
+        except Exception as e:
+            self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {str(e)}")
+
+    def clear_task_queue(self):
+        """Clear all tasks from the queue"""
+        self.task_queue_list.clear()
+        self.task_execution_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Task queue cleared")
 
 
 def main():

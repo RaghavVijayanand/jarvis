@@ -98,10 +98,19 @@ Keep responses focused and practical. When asked about your identity or who crea
         
         raise Exception("All connection attempts failed")
     
-    def process_command(self, command):
-        """Process command using OpenRouter DeepSeek model"""
+    def process_command(self, command, skills=None):
+        """Process command using OpenRouter DeepSeek model with skill routing"""
         if not self.available:
             return "I'm sorry, my AI capabilities are currently unavailable."
+        
+        # Initialize skill routing
+        self.last_skill_request = None
+        
+        # Check if we should route to a skill first
+        if skills:
+            skill_response = self._route_to_skill(command.lower(), skills)
+            if skill_response:
+                return skill_response
         
         try:
             # Add user message to conversation
@@ -192,3 +201,54 @@ Keep responses focused and practical. When asked about your identity or who crea
             summary += f"{role}: {content}\n"
         
         return summary
+    
+    def _route_to_skill(self, command, skills):
+        """Intelligently route commands to appropriate skills"""
+        # Weather requests
+        if any(word in command for word in ['weather', 'temperature', 'forecast', 'rain', 'sunny', 'cloudy']) and 'weather' in skills:
+            self.last_skill_request = 'weather'
+            return "Let me get the weather information for you..."
+        
+        # System monitoring
+        elif any(word in command for word in ['cpu', 'memory', 'system', 'performance', 'usage', 'ram', 'disk']) and 'system_monitor' in skills:
+            self.last_skill_request = 'system_monitor'
+            return "Checking system performance..."
+        
+        # File operations
+        elif any(word in command for word in ['file', 'folder', 'directory', 'create', 'delete', 'move', 'copy']) and 'file_manager' in skills:
+            self.last_skill_request = 'file_manager'
+            return "Processing file operation..."
+        
+        # Web search
+        elif any(word in command for word in ['search', 'google', 'find online', 'look up', 'web']) and 'web_search' in skills:
+            self.last_skill_request = 'web_search'
+            return "Searching the web..."
+        
+        # Calculator/math
+        elif (any(word in command for word in ['calculate', 'math', 'compute', 'solve']) or 
+              any(op in command for op in ['+', '-', '*', '/', '=', '%']) or
+              (any(char.isdigit() for char in command) and any(word in command for word in ['what', 'how much', 'plus', 'minus', 'times', 'divided']))) and 'utility' in skills:
+            self.last_skill_request = 'utility_math'
+            return "Calculating..."
+        
+        # Jokes
+        elif any(word in command for word in ['joke', 'funny', 'humor', 'laugh']) and 'utility' in skills:
+            self.last_skill_request = 'utility_joke'
+            return "Let me tell you a joke..."
+        
+        # Calculator app
+        elif any(phrase in command for phrase in ['open calculator', 'launch calculator', 'start calculator']):
+            self.last_skill_request = 'calculator'
+            return "Opening calculator..."
+        
+        # Screen automation / clicking
+        elif any(word in command for word in ['click', 'automate', 'screen', 'find and click', 'press', 'tap']):
+            self.last_skill_request = 'screen_automation'
+            return "Preparing screen automation..."
+        
+        # Complex tasks
+        elif any(phrase in command for phrase in ['set alarm', 'send email', 'create document', 'take screenshot']):
+            self.last_skill_request = 'visual_task_orchestrator'
+            return "Processing complex task..."
+        
+        return None

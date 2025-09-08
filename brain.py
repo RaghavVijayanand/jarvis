@@ -89,12 +89,15 @@ class AIBrain:
             "voice_questions": ["can you speak", "do you talk", "voice", "sound", "audio"]
         }
         
-    def process_command(self, command):
-        """Process natural language command and generate response"""
+    def process_command(self, command, skills=None):
+        """Process natural language command and generate response with intelligent skill routing"""
         if not command or not command.strip():
             return self._get_response("unknown")
-        
+
         command = command.strip().lower()
+        
+        # Initialize skill routing
+        self.last_skill_request = None
         
         # Add to conversation history
         self.conversation_history.append({
@@ -102,12 +105,23 @@ class AIBrain:
             "content": command,
             "timestamp": time.time()
         })
-        
+
         # Limit conversation history
         if len(self.conversation_history) > 10:
             self.conversation_history = self.conversation_history[-8:]
-        
-        # Process command patterns
+
+        # Intelligent skill routing first
+        if skills:
+            skill_response = self._route_to_skill(command, skills)
+            if skill_response:
+                self.conversation_history.append({
+                    "role": "assistant", 
+                    "content": skill_response,
+                    "timestamp": time.time()
+                })
+                return skill_response
+
+        # Process command patterns for general responses
         response = self._handle_command_patterns(command)
         if response:
             # Add to conversation history
@@ -117,9 +131,16 @@ class AIBrain:
                 "timestamp": time.time()
             })
             return response
-        
+
         # Fallback to basic responses
         return self._get_response("unknown")
+    
+    def _route_to_skill(self, command, skills):
+        """Pure conversational routing - no keywords, just natural understanding"""
+        # This basic brain doesn't do complex routing
+        # It will rely on the conversation patterns and natural responses
+        # The advanced brains (Gemini, etc.) will handle smart routing
+        return None
     
     def _handle_command_patterns(self, command):
         """Handle command patterns with intelligent responses"""

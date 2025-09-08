@@ -3,6 +3,14 @@ import json
 import requests
 from pathlib import Path
 
+# Try to load user configuration first
+try:
+    from config_user import *
+    print("✅ Loaded user configuration from config_user.py")
+except ImportError:
+    print("ℹ️  No user configuration found. Using default settings.")
+    # Default configuration values will be set below
+
 # Lightweight .env loader/saver for GUI settings (stored in %APPDATA%/Jarvis/.env on Windows)
 from pathlib import Path as _Path
 
@@ -67,14 +75,20 @@ class Config:
     
     # OpenRouter Configuration
     OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-    OPENROUTER_MODEL = "deepseek/deepseek-v3"  # Default to DeepSeek V3
+    OPENROUTER_MODEL = "openai/gpt-4o-mini"  # Use GPT-4o Mini - reliable and fast
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
     USE_OPENROUTER = bool(OPENROUTER_API_KEY)
     
-    # Gemini Configuration
+    # Vision Configuration
+    VISION_PROVIDER = "openrouter"  # Use OpenRouter for vision tasks
+    VISION_MODEL = "openai/gpt-4o"  # High-quality vision model for accurate UI automation
+    
+    # Gemini Configuration (direct Gemini optional; OpenRouter preferred)
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL = "gemini-2.0-flash-exp"
+    GEMINI_MODEL = "gemini-1.5-flash"  # Official Gemini API model name format
     USE_GEMINI = bool(GEMINI_API_KEY)
+    # Vision availability (OpenRouter or direct Gemini)
+    USE_VISION = bool(OPENROUTER_API_KEY or GEMINI_API_KEY)
     
     # Multi-Model Settings
     USE_MULTI_MODEL = True  # Enable advanced multi-model support
@@ -85,9 +99,9 @@ class Config:
         "coding": "deepseek-coder",
         "analysis": "claude-3.5-sonnet", 
         "creative": "gpt-4o",
-        "vision": "gemini-2.0-flash",
-        "fast": "gemini-2.0-flash",
-        "free": "qwen-2.5-vl",
+        "vision": "qwen/qwen-2.5-vl-7b-instruct",  # Free vision model
+        "fast": "qwen/qwen-2.5-vl-7b-instruct",
+        "free": "qwen/qwen-2.5-vl-7b-instruct",
         "reasoning": "deepseek-v3"
     }
     
@@ -98,6 +112,18 @@ class Config:
     
     # Voice Settings
     WAKE_WORD = "jarvis"
+    
+    # Screen Automation Settings
+    SCREEN_AUTOMATION_ENABLED = True
+    # Use absolute screenshot path based on BASE_DIR
+    AUTOMATION_SCREENSHOT_PATH = str((Path(__file__).parent / "cache" / "screenshots").resolve())
+    AUTOMATION_CONFIRMATION_REQUIRED = True
+    AUTOMATION_SAFE_MODE = True
+    AUTOMATION_VISION_PROVIDER = "openrouter"  # Use OpenRouter for vision
+    AUTOMATION_VISION_MODEL = "openai/gpt-4o"  # High-quality vision model for automation
+    AUTOMATION_CONFIDENCE_THRESHOLD = 0.7
+    AUTOMATION_MAX_RETRIES = 3
+    AUTOMATION_ACTION_DELAY = 1.0
     VOICE_RATE = 180        # Slower rate for more natural speech
     VOICE_VOLUME = 0.9
     VOICE_ID = 0
@@ -173,8 +199,9 @@ class Config:
     MEMORY_DIR = BASE_DIR / "memory"
     CACHE_DIR = BASE_DIR / "cache"
     
-    # Create directories
-    for directory in [LOGS_DIR, SKILLS_DIR, DATA_DIR, MEMORY_DIR, CACHE_DIR]:
+    # Create directories (also ensure screenshots dir exists)
+    SCREENSHOTS_DIR = Path(AUTOMATION_SCREENSHOT_PATH)
+    for directory in [LOGS_DIR, SKILLS_DIR, DATA_DIR, MEMORY_DIR, CACHE_DIR, SCREENSHOTS_DIR]:
         directory.mkdir(exist_ok=True)
     
     # API Keys (environment variables)

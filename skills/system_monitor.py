@@ -39,6 +39,49 @@ class SystemMonitor:
             'temp_critical': 85
         }
     
+    def get_cpu_info(self) -> Dict:
+        """Get CPU usage information"""
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            cpu_count = psutil.cpu_count()
+            cpu_freq = psutil.cpu_freq()
+            
+            return {
+                'usage': cpu_percent,
+                'cores': cpu_count,
+                'frequency': cpu_freq.current if cpu_freq else 0
+            }
+        except Exception as e:
+            return {'usage': 0, 'cores': 0, 'frequency': 0, 'error': str(e)}
+    
+    def get_memory_info(self) -> Dict:
+        """Get memory usage information"""
+        try:
+            memory = psutil.virtual_memory()
+            
+            return {
+                'total_gb': memory.total / (1024**3),
+                'used_gb': memory.used / (1024**3),
+                'available_gb': memory.available / (1024**3),
+                'percentage': memory.percent
+            }
+        except Exception as e:
+            return {'total_gb': 0, 'used_gb': 0, 'available_gb': 0, 'percentage': 0, 'error': str(e)}
+    
+    def get_disk_info(self) -> Dict:
+        """Get disk usage information"""
+        try:
+            disk_usage = psutil.disk_usage('C:' if os.name == 'nt' else '/')
+            
+            return {
+                'total_gb': disk_usage.total / (1024**3),
+                'used_gb': disk_usage.used / (1024**3),
+                'free_gb': disk_usage.free / (1024**3),
+                'percentage': (disk_usage.used / disk_usage.total) * 100
+            }
+        except Exception as e:
+            return {'total_gb': 0, 'used_gb': 0, 'free_gb': 0, 'percentage': 0, 'error': str(e)}
+
     def get_system_info(self) -> str:
         """Get basic system information for quick reference"""
         try:

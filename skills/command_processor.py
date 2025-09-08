@@ -7,6 +7,7 @@ import re
 import time
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta
+from skills.screen_automation import process_automation_command
 
 class CommandProcessor:
     def __init__(self, jarvis_instance):
@@ -35,12 +36,63 @@ class CommandProcessor:
             r"once\s+(.*?)\s+(?:then\s+)?(.*)",
         ]
         
+        # Automation patterns including complex multi-step tasks
+        self.automation_patterns = [
+            r"automate\s+(.*)",
+            r"auto\s+(.*)",
+            r"screen\s+(.*)",
+            r"ai\s+help\s+with\s+(.*)",
+            r"click\s+(?:on\s+)?(?:the\s+)?(.*)",
+            r"find\s+and\s+click\s+(?:on\s+)?(?:the\s+)?(.*)",
+            r"locate\s+and\s+click\s+(?:on\s+)?(?:the\s+)?(.*)",
+            r"press\s+(?:on\s+)?(?:the\s+)?(.*)",
+            r"tap\s+(?:on\s+)?(?:the\s+)?(.*)",
+        ]
+        
+        # Complex task patterns - high-level automation
+        self.complex_task_patterns = [
+            r"set\s+(?:an?\s+)?alarm\s+(?:for\s+|at\s+)?(.+)",
+            r"(?:wake\s+me\s+up|alarm)\s+(?:at\s+|in\s+|for\s+)(.+)",
+            r"send\s+(?:an?\s+)?email\s+(?:to\s+)?(.+)",
+            r"(?:compose|write)\s+(?:an?\s+)?email\s+(?:to\s+)?(.+)",
+            r"set\s+(?:a\s+)?reminder\s+(?:to\s+)?(.+)",
+            r"remind\s+me\s+(?:to\s+)?(.+)",
+            r"set\s+(?:a\s+)?timer\s+(?:for\s+)?(.+)",
+            r"(?:start|begin)\s+(?:a\s+)?timer\s+(?:for\s+)?(.+)",
+            r"(?:open|go\s+to|navigate\s+to|visit)\s+(?:website\s+)?(.+\.(?:com|org|net|edu|io|co\.uk))",
+            r"(?:create|make|write)\s+(?:a\s+|new\s+)?document\s+(?:about\s+|with\s+|containing\s+)?(.+)",
+            r"take\s+(?:a\s+)?screenshot",
+            r"(?:capture|snip)\s+(?:the\s+)?screen",
+        ]
+        
         # File operation context
         self.file_context = {}
         
     def parse_complex_command(self, command: str) -> List[Dict]:
         """Parse complex commands into executable steps"""
         steps = []
+        
+        # Check for complex multi-step tasks first
+        complex_task_match = self._match_pattern(command, self.complex_task_patterns)
+        if complex_task_match:
+            task_details = complex_task_match[0] if isinstance(complex_task_match, tuple) else complex_task_match
+            steps.append({
+                'type': 'complex_task',
+                'task_details': task_details,
+                'raw_command': command
+            })
+            return steps
+        
+        # Check for automation commands
+        automation_match = self._match_pattern(command, self.automation_patterns)
+        if automation_match:
+            automation_goal = automation_match[0] if isinstance(automation_match, tuple) else automation_match
+            steps.append({
+                'type': 'automation',
+                'goal': automation_goal,
+                'raw_command': command
+            })
+            return steps
         
         # Check for conditional commands
         conditional_match = self._match_pattern(command, self.conditional_patterns)
@@ -284,6 +336,14 @@ class CommandProcessor:
                     result = self._execute_file_creation_with_content(step, use_voice)
                     results.append(result)
                 
+                elif step['type'] == 'automation':
+                    result = self._execute_automation(step, use_voice)
+                    results.append(result)
+                
+                elif step['type'] == 'complex_task':
+                    result = self._execute_complex_task(step, use_voice)
+                    results.append(result)
+                
                 elif step['type'] == 'simple':
                     # Use existing JARVIS command processing
                     self.jarvis.process_command(step['command'], use_voice=False)
@@ -364,6 +424,91 @@ class CommandProcessor:
 
         return result
     
+    def _execute_automation(self, step: Dict, use_voice: bool) -> str:
+        """Execute automation step using screen automation"""
+        goal = step['goal']
+        raw_command = step.get('raw_command', '')
+        
+        try:
+            # Import screen automation for direct access
+            from skills.screen_automation import ScreenAutomationSkill
+            automation = ScreenAutomationSkill(self.jarvis)
+            
+            if use_voice:
+                self.jarvis.voice_engine.speak(f"Starting automation for: {goal}")
+            
+            # Check if this is a specific click command
+            click_patterns = [
+                r"click\s+(?:on\s+)?(?:the\s+)?(.*)",
+                r"find\s+and\s+click\s+(?:on\s+)?(?:the\s+)?(.*)",
+                r"locate\s+and\s+click\s+(?:on\s+)?(?:the\s+)?(.*)",
+                r"press\s+(?:on\s+)?(?:the\s+)?(.*)",
+                r"tap\s+(?:on\s+)?(?:the\s+)?(.*)",
+            ]
+            
+            # Check for click commands
+            for pattern in click_patterns:
+                match = re.search(pattern, raw_command.lower())
+                if match:
+                    element_name = match.group(1).strip()
+                    if use_voice:
+                        self.jarvis.voice_engine.speak(f"Looking for {element_name}")
+                    
+                    # Use the enhanced find and click functionality
+                    result = automation.find_and_click_element(element_name)
+                    
+                    if result.get('success', False):
+                        coords = result.get('coordinates', [])
+                        confidence = result.get('confidence', 0)
+                        success_msg = f"Successfully clicked {element_name} at {coords} (confidence: {confidence:.2f})"
+                        
+                        if use_voice:
+                            self.jarvis.voice_engine.speak(f"Successfully clicked {element_name}")
+                        
+                        return success_msg
+                    else:
+                        error_msg = result.get('message', f"Could not find {element_name}")
+                        if use_voice:
+                            self.jarvis.voice_engine.speak(f"Could not find {element_name}")
+                        return error_msg
+            
+            # For other automation commands, use the general automation system
+            result = process_automation_command(f"automate {goal}", self.jarvis)
+            
+            if use_voice:
+                self.jarvis.voice_engine.speak("Automation completed")
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"Automation failed: {str(e)}"
+            if use_voice:
+                self.jarvis.voice_engine.speak("Automation failed")
+            return error_msg
+    
+    def _execute_complex_task(self, step: Dict, use_voice: bool) -> str:
+        """Execute a complex multi-step task"""
+        try:
+            from skills.visual_task_orchestrator import process_visual_task
+            
+            raw_command = step['raw_command']
+            result = process_visual_task(raw_command)
+            
+            if use_voice:
+                # Provide brief voice feedback
+                if "✅" in result:
+                    self.jarvis.voice_engine.speak("Complex task completed successfully")
+                else:
+                    self.jarvis.voice_engine.speak("Complex task encountered an issue")
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"Complex task failed: {str(e)}"
+            if use_voice:
+                self.jarvis.voice_engine.speak("Complex task failed")
+            return error_msg
+    
     def get_command_suggestions(self, partial_command: str) -> List[str]:
         """Get command suggestions based on partial input"""
         suggestions = []
@@ -377,7 +522,21 @@ class CommandProcessor:
             "search for weather then take screenshot of results",
             "create folder called 'projects' then create file inside it",
             "launch calculator, wait 2 seconds, then type 5*5",
-            "if file exists data.txt then read it, otherwise create it"
+            "if file exists data.txt then read it, otherwise create it",
+            "automate opening calculator and calculating 5+5",
+            "automate clicking on the start menu",
+            "automate taking a screenshot and saving it",
+            "ai help with opening browser and searching for news",
+            "screen automation to close all windows",
+            "auto navigate to website and fill form",
+            # Complex task suggestions
+            "set alarm for 7:30 AM",
+            "send email to john@example.com subject meeting reminder",
+            "set reminder to call mom in 2 hours",
+            "set timer for 10 minutes",
+            "create document about artificial intelligence",
+            "take screenshot",
+            "open website google.com"
         ]
         
         # Filter suggestions based on partial command

@@ -21,9 +21,14 @@ class OpenRouterLLM(LLM):
             if self._multi_brain:
                 return self._multi_brain.process_command(prompt, use_context=False)
             else:
+                # Check if API key is available
+                api_key = Config.OPENROUTER_API_KEY
+                if not api_key:
+                    return "API key not configured. Please set your OpenRouter API key in Settings."
+                
                 # Fallback to direct OpenRouter call with a working model
                 headers = {
-                    "Authorization": f"Bearer {Config.OPENROUTER_API_KEY}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
                 }
                 
@@ -44,7 +49,7 @@ class OpenRouterLLM(LLM):
                     result = response.json()
                     return result["choices"][0]["message"]["content"]
                 else:
-                    return f"Error: {response.status_code} - {response.text}"
+                    return f"OpenRouter API error: {response.status_code} - {response.text}"
                     
         except Exception as e:
             return f"Error calling AI model: {e}"
@@ -404,8 +409,8 @@ If you cannot use tools or get an error, provide a direct response to help the u
                     return llm_result
             
             # Otherwise, use the agent
-            result = self.agent.run(query)
-            return result
+            result = self.agent.invoke({"input": query})
+            return result.get("output", "I couldn't process that request properly.")
         except Exception as e:
             error_msg = str(e).lower()
             # Check for parsing errors and provide helpful responses

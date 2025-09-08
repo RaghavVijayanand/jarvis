@@ -296,15 +296,27 @@ class AdvancedAIBrain:
         
         return full_prompt
     
-    def process_command(self, command):
-        """Process command using advanced AI capabilities"""
+    def process_command(self, command, skills=None):
+        """Process command using advanced AI capabilities with intelligent skill routing"""
         try:
             console.print(f"[cyan]🤖 Advanced AI processing: {command}[/cyan]")
             
+            # Analyze command and determine if we need to route to a skill
+            self.last_skill_request = None
+            
             # Try to get Gemini response first
             if self.gemini_available:
-                response = self.get_gemini_response(command)
+                # Enhance the prompt to include skill routing instructions
+                enhanced_command = self._enhance_command_with_skills(command, skills)
+                response = self.get_gemini_response(enhanced_command)
                 if response:
+                    # Check if the response indicates we should use a skill
+                    skill_to_use = self._extract_skill_request(response)
+                    if skill_to_use:
+                        self.last_skill_request = skill_to_use
+                        # Return a message indicating skill routing
+                        return f"Routing to {skill_to_use} skill..."
+                    
                     # Store in conversation history
                     self.conversation_history.append({
                         'user': command,
@@ -318,12 +330,89 @@ class AdvancedAIBrain:
                     
                     return response
             
-            # Fallback to pattern-based responses
-            return self.get_fallback_response(command)
+            # Fallback to intelligent pattern-based routing
+            return self.get_intelligent_fallback_response(command, skills)
             
         except Exception as e:
             console.print(f"[red]Error in advanced processing: {e}[/red]")
             return "I apologize, but I encountered an error processing your request. Please try again."
+    
+    def _enhance_command_with_skills(self, command, skills):
+        """Enhance command with comprehensive skill information for intelligent AI routing"""
+        if not skills:
+            return command
+        
+        available_skills = list(skills.keys())
+        
+        # Detailed skill descriptions for better AI understanding
+        skill_descriptions = {
+            'weather': 'Provides weather information, forecasts, temperature, precipitation, and atmospheric conditions for any location',
+            'system_monitor': 'Monitors computer performance including CPU usage, memory consumption, disk space, running processes, and system health',
+            'file_manager': 'Handles file and folder operations like creating, deleting, moving, copying, renaming, organizing, and managing documents',
+            'web_search': 'Searches the internet for information, news, articles, research, definitions, tutorials, and answers to questions',
+            'utility': 'Performs mathematical calculations, tells jokes, provides entertainment, handles general utility functions and problem-solving',
+            'screen_automation': 'Automates screen interactions, clicks buttons, finds elements, controls GUI applications, and performs interface navigation',
+            'visual_task_orchestrator': 'Handles complex multi-step tasks like scheduling, reminders, alarms, emails, document creation, and workflow automation'
+        }
+        
+        # Create a comprehensive context for the AI
+        enhancement = f"""You are JARVIS, an intelligent AI assistant. A user has made the following request:
+
+"{command}"
+
+Available capabilities and skills:
+{chr(10).join([f"• {skill}: {skill_descriptions.get(skill, 'General purpose functionality')}" for skill in available_skills])}
+
+Instructions for response:
+1. If this request can be handled by a specific skill, respond with: "ROUTE_TO_SKILL: [skill_name]" (and optionally ":action" for utility skills)
+   - For calculations/math: "ROUTE_TO_SKILL: utility:math" 
+   - For jokes/entertainment: "ROUTE_TO_SKILL: utility:joke"
+   - For other skills: "ROUTE_TO_SKILL: [skill_name]"
+2. If this is a general conversation, question, or request that doesn't need a specific skill, provide a helpful, natural response
+3. Always be conversational and helpful
+4. Analyze the user's intent, not keywords
+5. Think about what the user really wants to accomplish
+
+Examples of skill routing:
+- "What's the weather like?" → "ROUTE_TO_SKILL: weather"
+- "How's my computer running?" → "ROUTE_TO_SKILL: system_monitor"
+- "Can you help me find information about..." → "ROUTE_TO_SKILL: web_search"
+- "Calculate 25% of 200" → "ROUTE_TO_SKILL: utility:math"
+- "What is 10 minus 10?" → "ROUTE_TO_SKILL: utility:math"
+- "Tell me a joke" → "ROUTE_TO_SKILL: utility:joke"
+- "Create a new folder" → "ROUTE_TO_SKILL: file_manager"
+- "Click the submit button" → "ROUTE_TO_SKILL: screen_automation"
+- "Set a reminder for tomorrow" → "ROUTE_TO_SKILL: visual_task_orchestrator"
+
+Remember: Analyze the user's actual intent. If they ask "what's 10-10" or "can you calculate 10-10", this is clearly a math request regardless of the words used.
+"""
+        
+        return enhancement
+    
+    def _extract_skill_request(self, response):
+        """Extract skill request from AI response"""
+        if "ROUTE_TO_SKILL:" in response:
+            import re
+            match = re.search(r"ROUTE_TO_SKILL:\s*([^\\n\\r]+)", response)
+            if match:
+                return match.group(1).strip()
+        # Legacy support
+        if "USE_SKILL:" in response:
+            import re
+            match = re.search(r"USE_SKILL:\s*(\w+)", response)
+            if match:
+                return match.group(1)
+        return None
+    
+    def get_intelligent_fallback_response(self, command, skills=None):
+        """Advanced intelligent fallback response - pure LLM analysis without keywords"""
+        # If no skills available, just provide a normal conversational response
+        if not skills:
+            return self.get_fallback_response(command)
+        
+        # For fallback (when Gemini is not available), provide a simple routing message
+        # This should rarely be used since Gemini handles the main routing
+        return "I understand your request. Let me see how I can help you with that."
     
     def get_fallback_response(self, command):
         """Get fallback response when Gemini is not available"""

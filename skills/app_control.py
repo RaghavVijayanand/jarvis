@@ -128,6 +128,9 @@ class ApplicationControl:
                 'chrome': 'chrome.exe',
                 'google chrome': 'chrome.exe',
                 'firefox': 'firefox.exe',
+                'opera': 'opera.exe',
+                'opera browser': 'opera.exe',
+                'brave': 'brave.exe',
                 'edge': 'msedge.exe',
                 'microsoft edge': 'msedge.exe',
                 'discord': 'Discord.exe',
@@ -193,6 +196,19 @@ class ApplicationControl:
                 f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Local",
                 f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Roaming"
             ]
+            
+            # Special handling for browsers like Opera
+            if app_name_lower in ['opera', 'opera browser']:
+                opera_paths = [
+                    "C:\\Program Files\\Opera\\opera.exe",
+                    "C:\\Program Files (x86)\\Opera\\opera.exe",
+                    f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Local\\Programs\\Opera\\opera.exe",
+                    f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Roaming\\Opera Software\\Opera Stable\\opera.exe"
+                ]
+                
+                for opera_path in opera_paths:
+                    if os.path.exists(opera_path):
+                        return self._launch_with_verification(opera_path, app_name)
             
             for base_path in search_paths:
                 if os.path.exists(base_path):
