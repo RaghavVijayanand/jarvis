@@ -36,13 +36,21 @@ def _argv0(args):
     return os.path.basename(first.strip('"')).lower()
 
 
+# JARVIS_STRICT_GUARD=1 (set in CI): a blocked call fails its test instead of only being
+# listed at the end. Checked at teardown too, since app code often swallows exceptions.
+_STRICT = os.environ.get("JARVIS_STRICT_GUARD", "").strip() == "1"
+
+
 @pytest.fixture(autouse=True)
 def _block_real_side_effects(monkeypatch, request):
     test_id = request.node.nodeid
+    before = len(_BLOCKED)
 
     def blocker(what, result=0):
         def fake(*args, **kwargs):
             _BLOCKED.append((test_id, what))
+            if _STRICT:
+                raise AssertionError(f"test touched the real PC: {what}")
             return result
         return fake
 
@@ -79,6 +87,12 @@ def _block_real_side_effects(monkeypatch, request):
             monkeypatch.setattr(pyautogui, name, blocker(f"pyautogui.{name}", None), raising=False)
     except Exception:
         pass
+
+    yield
+    if _STRICT:
+        touched = [what for tid, what in _BLOCKED[before:] if tid == test_id]
+        if touched:
+            pytest.fail("test touched the real PC (mock it): " + ", ".join(sorted(set(touched))), pytrace=False)
 
 
 def pytest_terminal_summary(terminalreporter):

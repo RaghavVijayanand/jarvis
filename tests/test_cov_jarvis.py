@@ -399,11 +399,12 @@ class MetaCommandTests(QuietCase):
         app = make_app()
         self.assertIsNone(app._meta_command("stop", "stop"))
         app.screen_automation = Mock(is_running=True)
-        self.assertIn("Stopping", app._meta_command("stop", "stop"))
+        self.assertEqual(app._meta_command("stop", "stop"), "Stopped screen automation.")
         app.screen_automation.stop_automation.assert_called_once()
         app.screen_automation = None
         app._active_session = Mock(busy=True)
-        self.assertIn("Stopping", app._meta_command("abort", "abort"))
+        app._active_session.stop.return_value = {"running": 1, "queued": 2}
+        self.assertEqual(app._meta_command("abort", "abort"), "Stopped 1 running step and 2 queued steps.")
         app._active_session.stop.assert_called_once()
 
 

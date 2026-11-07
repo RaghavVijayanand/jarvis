@@ -61,6 +61,7 @@ class TrayApp(QObject):
             tray.buddy_toggled.connect(self.set_buddy)
             tray.voice_toggled.connect(self.set_live_voice)
             tray.startup_toggled.connect(self.set_startup)
+            tray.stop.connect(self.stop_everything)
             tray.quit.connect(self.quit)
             from core import autostart
             tray.set_checked(tray.act_startup, autostart.is_enabled())
@@ -84,6 +85,13 @@ class TrayApp(QObject):
     def open_settings(self):
         self.show_dashboard()
         self.window.open_settings()
+
+    def stop_everything(self):
+        """Tray "Stop everything": same global stop as the hotkey and the dashboard's Stop button."""
+        stop = getattr(self.window, "stop_current", None)
+        summary = stop() if stop is not None else None
+        if summary and self.tray is not None and not self.window.isVisible():
+            self.tray.notify("JARVIS", summary)
 
     def _submit(self, text):
         if not self.window.submit_from_bar(text):

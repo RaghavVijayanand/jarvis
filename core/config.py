@@ -171,6 +171,7 @@ class Config:
     BUDDY_HOTKEY = "ctrl+alt"         # hold to talk; see core.buddy.HOTKEYS
     COMMAND_BAR_HOTKEY = "ctrl+shift+space"   # opens the floating command bar; see core.hotkeys
     CONVERSATION_HOTKEY = "f8"        # starts / ends hands-free conversation mode (core.conversation)
+    STOP_HOTKEY = "ctrl+alt+esc"      # stops everything in progress; see core.hotkeys.STOP_HOTKEYS
     ONBOARDED = False                 # the first-run welcome has been completed
 
     # Safety / automation
@@ -240,6 +241,8 @@ class Config:
         cls.BUDDY_HOTKEY = hotkey if hotkey in ("ctrl+alt", "right ctrl", "ctrl+shift", "ctrl+win", "f9") else "ctrl+alt"
         bar = os.getenv("JARVIS_COMMAND_BAR_HOTKEY", "ctrl+shift+space").strip().lower()
         cls.COMMAND_BAR_HOTKEY = bar if bar in ("ctrl+shift+space", "ctrl+shift+j", "alt+j", "f8") else "ctrl+shift+space"
+        stop = os.getenv("JARVIS_STOP_HOTKEY", "ctrl+alt+esc").strip().lower()
+        cls.STOP_HOTKEY = stop if stop in ("ctrl+alt+esc", "ctrl+alt+x", "pause") else "ctrl+alt+esc"
         talk = os.getenv("JARVIS_CONVERSATION_HOTKEY", "f8").strip().lower()
         cls.CONVERSATION_HOTKEY = talk if talk in ("f8", "f7", "f10", "ctrl+shift+t") else "f8"
         cls.ONBOARDED = _env_bool("JARVIS_ONBOARDED", False)

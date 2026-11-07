@@ -62,6 +62,10 @@ class FileTestBase(unittest.TestCase):
         env = patch.dict(os.environ, {"APPDATA": str(self.home / "AppData" / "Roaming")})
         env.start()
         self.addCleanup(env.stop)
+        # "open …" must never launch real apps or Explorer windows on a Windows test machine.
+        opener = patch.object(os, "startfile", create=True)
+        self.startfile = opener.start()
+        self.addCleanup(opener.stop)
         self.fm = FileManagerSkill()
         self.fm.current_directory = str(self.work)
 

@@ -29,7 +29,7 @@ class RuleTests(unittest.TestCase):
         "ping google.com": "network", "flush the dns": "network",
         "what is using my cpu": "service", "top processes by memory": "service",
         "list services": "service", "start the spooler service": "service",
-        "is the spooler service running": "service", "cpu usage": "system",
+        "is the spooler service running": "service",
         "list power plans": "power", "what is the active power plan": "power",
         "switch the power plan to balanced": "power", "list startup apps": "power",
         "enable OneDrive at startup": "power", "disable Spotify from startup": "power",

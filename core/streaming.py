@@ -339,6 +339,28 @@ class StreamingSession:
         self._emit("utterance_done", heard=text, summary="Stopped.", details="Stopped.")
         return True
 
+    def cancel_in_flight(self) -> Dict[str, int]:
+        """The global stop: drop this utterance's live and deferred steps and answer any spoken
+        yes/no question with "no". The microphone keeps listening — stopping work is not turning
+        live voice off. Safe from any thread; returns what was cut short."""
+        with self._lock:
+            session, deferred, ask = self._exec, self._deferred, self._ask
+            self._exec, self._deferred, self._heard = None, [], []
+            self.tracker.reset()
+        counts = {"running": 0, "queued": len(deferred), "asks": 0}
+        if ask is not None and not ask["event"].is_set():
+            ask["answer"] = False
+            ask["event"].set()
+            counts["asks"] = 1
+        if session is not None:
+            stopped = session.stop()
+            session.close()
+            counts["running"] += stopped.get("running", 0)
+            counts["queued"] += stopped.get("queued", 0)
+        if session is not None or deferred:
+            self._emit("utterance_done", heard="", summary="Stopped.", details="Stopped.")
+        return counts
+
     def _dispatch(self, link: str, clause: str):
         intent = self.jarvis._classify_command_intent(clause)
         with self._lock:

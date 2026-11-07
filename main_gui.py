@@ -947,6 +947,8 @@ class MainWindow(QMainWindow):
         self.worker.busy_changed.connect(self._set_thinking)
         self.worker.start()
         j.dashboard_runner = self._run_for_dashboard     # web dashboard commands share this one queue
+        if hasattr(j, "add_stop_hook"):
+            j.add_stop_hook(self._cancel_open_confirms)   # the global stop answers open dialogs "no"
 
         for step in (self.refresh_models, self.update_skills_tree, self.refresh_system_info):
             try:
@@ -981,6 +983,7 @@ class MainWindow(QMainWindow):
             local_speech.warm_up()           # Whisper takes ~20 s to load; do it before the first F8
         except Exception:
             log.exception("local speech warm-up failed")
+        self._install_stop_hotkey()
         self.ready.emit()
 
     def _update_greeting(self):
@@ -1970,12 +1973,24 @@ class MainWindow(QMainWindow):
 
     # ── Chat ─────────────────────────────────────────────────────────────────
 
+    def _stop_now_if_asked(self, text: str):
+        """A typed "stop" must not wait in the worker's queue behind the very task it should stop:
+        while something is running it is handled here, on the GUI thread, straight away."""
+        j = self.jarvis
+        if j is None or not hasattr(j, "stop_everything") or not j.is_stop_request(text) or not j.is_busy():
+            return None
+        summary = j.stop_everything()
+        self.append_text("JARVIS", summary)
+        return summary
+
     def on_send(self):
         text = self.input.text().strip()
         if not text or self.worker is None:
             return
         self.append_text("You", text)
         self.input.clear()
+        if self._stop_now_if_asked(text) is not None:
+            return
         self._reply_sources.append("window")
         self.worker.submit_chat(text, voice=self.btn_voice.isChecked())
 
@@ -1984,6 +1999,10 @@ class MainWindow(QMainWindow):
         if not text or self.worker is None:
             return False
         self.append_text("You", text)
+        summary = self._stop_now_if_asked(text)
+        if summary is not None:
+            self.bar_reply.emit(summary)
+            return True
         self._reply_sources.append("bar")
         self.worker.submit_chat(text, voice=self.btn_voice.isChecked())
         return True
@@ -2035,9 +2054,37 @@ class MainWindow(QMainWindow):
             self.chat.set_typing(False)
 
     def stop_current(self):
+        """The Stop button, the tray's "Stop everything" and the queue's "Stop current"."""
         if self.jarvis:
-            self.jarvis.stop_current_task()
-            self.append_text("System", "Stop requested.")
+            stop = getattr(self.jarvis, "stop_everything", None) or self.jarvis.stop_current_task
+            summary = str(stop() or "Stop requested.")
+            self.append_text("System", summary)
+            return summary
+        return None
+
+    def _cancel_open_confirms(self) -> int:
+        """Global-stop hook (any thread): every yes/no dialog still waiting is answered "no"."""
+        cancelled = 0
+        for holder in list(self._pending_confirms):
+            if holder["event"].is_set():
+                continue
+            holder["answer"] = False
+            holder["event"].set()               # the waiting worker thread resumes with "no" now
+            cancelled += 1
+            box = holder.get("box")
+            if box is not None:
+                try:
+                    QMetaObject.invokeMethod(box, "reject", Qt.QueuedConnection)
+                except RuntimeError:
+                    pass                        # already answered and deleted
+        return cancelled
+
+    def _install_stop_hotkey(self):
+        install = getattr(self.jarvis, "install_stop_hotkey", None)
+        if install is None:
+            return
+        if not install():
+            log.warning("global stop hotkey unavailable; use the Stop button or the tray menu")
 
     def _run_task(self, label, fn, kind="auto"):
         if self.worker is None:
@@ -2235,6 +2282,7 @@ class MainWindow(QMainWindow):
             return
         self.append_text("System", "Settings saved.")
         self._update_greeting()
+        self._install_stop_hotkey()                       # picks up a changed stop hotkey
         self.settings_changed.emit()
 
     def open_memory(self):

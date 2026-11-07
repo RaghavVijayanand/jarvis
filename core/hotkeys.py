@@ -22,6 +22,14 @@ COMMAND_BAR_HOTKEYS: Dict[str, str] = {
     "f8": "F8",
 }
 
+# The global stop: cancels everything JARVIS is doing right now (never Ctrl+Shift+Esc,
+# which opens Task Manager). Ctrl+Alt+Esc is also screen automation's emergency stop.
+STOP_HOTKEYS: Dict[str, str] = {
+    "ctrl+alt+esc": "Ctrl + Alt + Esc",
+    "ctrl+alt+x": "Ctrl + Alt + X",
+    "pause": "Pause",
+}
+
 
 def to_pynput(combo: str) -> str:
     """'ctrl+shift+space' → '<ctrl>+<shift>+<space>' (single letters stay bare)."""
@@ -68,4 +76,4 @@ class TapHotkey:
 
     @property
     def label(self) -> str:
-        return COMMAND_BAR_HOTKEYS.get(self.combo, self.combo)
+        return COMMAND_BAR_HOTKEYS.get(self.combo) or STOP_HOTKEYS.get(self.combo, self.combo)

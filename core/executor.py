@@ -167,8 +167,18 @@ class ExecutionSession:
         for lane in self.lanes.values():
             lane.queue.put(None)
 
-    def stop(self):
+    def stop(self) -> Dict[str, int]:
+        """Stop at the next step boundary: queued steps are marked "stopped", a running ``wait``
+        ends now, a running command finishes its current call. Safe from any thread, idempotent.
+        Returns what was still in progress: {"running": n, "queued": n}."""
+        with self._lock:
+            steps = list(self.steps)
+        counts = {"running": sum(s.status == "running" for s in steps),
+                  "queued": sum(s.status == "queued" for s in steps)}
+        if self.stopped.is_set():
+            return {"running": 0, "queued": 0}          # already stopped: nothing new to report
         self.stopped.set()
+        return counts
 
     def close(self):
         with self._lock:

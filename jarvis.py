@@ -18,6 +18,7 @@ import re
 import sys
 import threading
 import time
+import weakref
 from datetime import datetime
 
 # Consoles that cannot encode Unicode (e.g. cp1252 when output is piped)
@@ -136,7 +137,17 @@ _CONFIRM_TTL = 120      # seconds a queued destructive action waits for its yes
 # answering: without one lock two simultaneous "yes" both pop, and the second approves an action
 # nobody said yes to.
 _PENDING_LOCK = threading.RLock()
+_STOP_LOCK = threading.RLock()       # one global stop at a time (hotkey, button and voice can coincide)
 _MAX_PLAN_STEPS = 25
+
+
+def _plural(n: int, noun: str) -> str:
+    return f"{n} {noun}" + ("" if n == 1 else "s")
+# "Stop everything" — only while something is in progress, so "stop" stays free for other uses
+# when JARVIS is idle. Anything naming a target ("stop the music", "cancel shutdown") is not this.
+_STOP_ALL = re.compile(r"(?:(?:hey\s+)?jarvis[,\s]+)?(?:stop|abort|cancel|halt)"
+                       r"(?:\s+(?:it|that|this|everything|all|all tasks|the task|task|tasks|automation|now|"
+                       r"what you'?re doing|what you are doing))?(?:[,\s]+(?:now|please|jarvis))*")
 
 
 class _NullVoice:
@@ -177,6 +188,9 @@ class JARVIS:
         self._stop_plan = threading.Event()
         self._input_lock = threading.Lock()   # steps that press keys / move focus take turns
         self._active_session = None
+        self._sessions = weakref.WeakSet()    # every live ExecutionSession (plans, live voice, queue)
+        self._stop_hooks = []                 # UI callbacks the global stop also runs (e.g. close dialogs)
+        self._stop_hotkey = None
         self._resolution_timer = None
         self.stream = None                    # live voice session (core/streaming.py) when active
         self._live_listener = None
@@ -447,6 +461,10 @@ class JARVIS:
         said, original_command = original_command, self._resolve_reference(tidy(original_command))
         command = original_command.lower().strip()
         bare = command.rstrip(".!? ")
+
+        # 0. "stop" / "cancel that" / "abort" while something is in progress: the global stop.
+        if _STOP_ALL.fullmatch(bare) and self.is_busy():
+            return self.stop_everything()
 
         # 1. A pending destructive action waits for yes/no.
         is_yes = _YES.fullmatch(bare)
@@ -809,6 +827,10 @@ class JARVIS:
                     _ORIGIN.voice = False
         session = ExecutionSession(run_step, self._settle, on_event)
         self._active_session = session
+        sessions = getattr(self, "_sessions", None)
+        if sessions is None:
+            sessions = self._sessions = weakref.WeakSet()
+        sessions.add(session)
         return session
 
     def _run_plan(self, plan):
@@ -854,17 +876,143 @@ class JARVIS:
             lines.append(f"{s.index + 1}. {tag}{s.text} → {s.reply or s.status}")
         return "\n".join(lines)
 
+    def _live_sessions(self):
+        sessions = set(getattr(self, "_sessions", None) or ())
+        active = getattr(self, "_active_session", None)
+        if active is not None:
+            sessions.add(active)
+        return sessions
+
+    def is_busy(self) -> bool:
+        """Is anything in progress that the global stop would cut short?"""
+        if any(getattr(s, "busy", False) for s in self._live_sessions()):
+            return True
+        screen = getattr(self, "screen_automation", None)
+        if screen is not None and getattr(screen, "is_running", False) is True:
+            return True
+        if getattr(self, "_pending_actions", None):
+            return True
+        stream = getattr(self, "stream", None)
+        if stream is not None and (getattr(stream, "_exec", None) is not None or getattr(stream, "_deferred", None)
+                                   or getattr(stream, "_ask", None) is not None):
+            return True
+        return getattr(getattr(self, "voice_engine", None), "is_speaking", False) is True
+
+    def add_stop_hook(self, hook) -> None:
+        """``hook()`` runs on every global stop (from any thread) and returns how many open
+        confirmations it cancelled — the GUI uses it to close its yes/no dialogs as "no"."""
+        hooks = getattr(self, "_stop_hooks", None)
+        if hooks is None:
+            hooks = self._stop_hooks = []
+        if hook not in hooks:
+            hooks.append(hook)
+
+    def stop_everything(self) -> str:
+        """The global stop: cancel all work in progress, from any thread, any number of times.
+
+        Plans and live-voice steps stop at the next step boundary (queued ones never start, waits
+        end now), screen automation and speech stop, and every pending yes/no is answered "no".
+        Scheduled reminders, alarms and watchers are the user's future plans and are left alone.
+        """
+        with _STOP_LOCK:
+            running = queued = asks = 0
+            plan_stop = getattr(self, "_stop_plan", None)
+            if plan_stop is not None:
+                plan_stop.set()
+            for session in self._live_sessions():
+                try:
+                    counts = session.stop()
+                except Exception:
+                    log.exception("stopping a session failed")
+                    continue
+                if isinstance(counts, dict):
+                    running += counts.get("running", 0)
+                    queued += counts.get("queued", 0)
+            stream = getattr(self, "stream", None)
+            cancel = getattr(stream, "cancel_in_flight", None)
+            if callable(cancel):
+                try:
+                    counts = cancel()
+                    if isinstance(counts, dict):
+                        running += counts.get("running", 0)
+                        queued += counts.get("queued", 0)
+                        asks += counts.get("asks", 0)
+                except Exception:
+                    log.exception("stopping live voice actions failed")
+            with _PENDING_LOCK:
+                pending = getattr(self, "_pending_actions", None) or []
+                asks += len(pending)
+                pending.clear()                       # cancelled, never approved
+            for hook in list(getattr(self, "_stop_hooks", None) or ()):
+                try:
+                    asks += int(hook() or 0)
+                except Exception:
+                    log.exception("stop hook failed")
+            automation = False
+            screen = getattr(self, "screen_automation", None)
+            if screen is not None:
+                automation = getattr(screen, "is_running", False) is True
+                try:
+                    screen.stop_automation()
+                except Exception:
+                    log.exception("stopping screen automation failed")
+            stop_speaking = getattr(getattr(self, "voice_engine", None), "stop_speaking", None)
+            if callable(stop_speaking):
+                try:
+                    stop_speaking()
+                except Exception:
+                    log.exception("stopping speech failed")
+        parts = []
+        if running:
+            parts.append(_plural(running, "running step"))
+        if queued:
+            parts.append(_plural(queued, "queued step"))
+        if asks:
+            parts.append(_plural(asks, "pending confirmation"))
+        if automation:
+            parts.append("screen automation")
+        if not parts:
+            return "Stopped. Nothing else was running."
+        listed = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+        return f"Stopped {listed}."
+
+    @staticmethod
+    def is_stop_request(text) -> bool:
+        """"stop", "cancel that", "jarvis abort!" … (but not "stop the music")."""
+        from core.natural import tidy
+        raw = str(text or "").strip()
+        return any(_STOP_ALL.fullmatch(t.lower().strip().rstrip(".!? ")) for t in (raw, tidy(raw)) if t)
+
     def stop_current_task(self):
-        if getattr(self, "_stop_plan", None) is not None:
-            self._stop_plan.set()
-        session = getattr(self, "_active_session", None)
-        if session is not None:
-            session.stop()
-        if getattr(self, "screen_automation", None):
-            try:
-                self.screen_automation.stop_automation()
-            except Exception:
-                log.exception("stopping screen automation failed")
+        """Older name for the global stop (the GUI's Stop button, shutdown)."""
+        return self.stop_everything()
+
+    def _stop_from_hotkey(self):
+        """Runs on the hotkey thread: stop, then say what happened wherever JARVIS shows messages."""
+        summary = self.stop_everything()
+        try:
+            self.notify(summary)
+        except Exception:
+            log.exception("announcing the stop failed")
+
+    def install_stop_hotkey(self) -> bool:
+        """Register the global stop hotkey (Config.STOP_HOTKEY). Re-installing swaps the combo."""
+        from core.hotkeys import TapHotkey
+        current = getattr(self, "_stop_hotkey", None)
+        if current is not None:
+            if current.combo == Config.STOP_HOTKEY:
+                return True
+            current.stop()
+        self._stop_hotkey = TapHotkey(Config.STOP_HOTKEY, self._stop_from_hotkey)
+        if not self._stop_hotkey.start():
+            self._stop_hotkey = None
+            return False
+        return True
+
+    def remove_stop_hotkey(self) -> None:
+        hotkey, self._stop_hotkey = getattr(self, "_stop_hotkey", None), None
+        if hotkey is not None:
+            hotkey.stop()
 
     # ── Meta commands ────────────────────────────────────────────────────────
 
@@ -890,12 +1038,8 @@ class JARVIS:
                     f"threshold: {d.threshold:.2f}.")
         if bare in ("refresh models", "update models", "scan models"):
             return brain.refresh_catalog() if brain else offline
-        if bare in ("stop", "stop automation", "abort", "cancel task", "stop task"):
-            screen = getattr(self, "screen_automation", None)
-            session = getattr(self, "_active_session", None)
-            if (screen and getattr(screen, "is_running", False)) or (session is not None and session.busy):
-                self.stop_current_task()
-                return "Stopping the current task."
+        if _STOP_ALL.fullmatch(bare) and self.is_busy():
+            return self.stop_everything()
         return None
 
     # ── Handlers ─────────────────────────────────────────────────────────────
@@ -993,6 +1137,10 @@ class JARVIS:
             self._report_missed_tasks()
         except Exception:
             log.exception("missed-task report failed")
+        if self.install_stop_hotkey():          # CLI; the GUI installs it when its window is ready
+            from core.hotkeys import STOP_HOTKEYS
+            console.print(f"[dim]Press {STOP_HOTKEYS.get(Config.STOP_HOTKEY, Config.STOP_HOTKEY)} "
+                          "anywhere to stop whatever I'm doing.[/dim]")
         welcome = self._welcome()
         if mode == "voice" and getattr(self.voice_engine, "sr_available", False):
             self.run_voice_mode()
@@ -1129,6 +1277,10 @@ class JARVIS:
             self.stop_current_task()
         except Exception:
             log.exception("stopping the current task failed")
+        try:
+            self.remove_stop_hotkey()
+        except Exception:
+            log.exception("removing the stop hotkey failed")
         listener = getattr(self, "_live_listener", None)
         if listener is not None:
             try:

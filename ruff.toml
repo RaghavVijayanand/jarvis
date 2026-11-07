@@ -1,0 +1,8 @@
+# Lint for real bugs only (CI fails on these): syntax errors, undefined names,
+# misplaced return/yield/break, and comparisons that are always wrong (`x is "a"`).
+# Style rules are deliberately left off.
+target-version = "py310"
+extend-exclude = ["_hf_cache", "_to_delete", "_pyibuild", "dist", "cache", "data", "logs", "memory"]
+
+[lint]
+select = ["E9", "F63", "F7", "F82"]

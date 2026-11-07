@@ -52,7 +52,8 @@ ROW_KEYS = {
     "Live voice": ("JARVIS_LIVE_VOICE",), "Act on commands": ("JARVIS_ACT_MODE",),
     "Live speech model": ("JARVIS_VOSK_MODEL_NAME",), "Vosk model folder": ("JARVIS_VOSK_MODEL",),
     "Buddy mode": ("JARVIS_BUDDY",), "Buddy hotkey": ("JARVIS_BUDDY_HOTKEY",),
-    "Command bar hotkey": ("JARVIS_COMMAND_BAR_HOTKEY",), "Start with Windows": ("startup",),
+    "Command bar hotkey": ("JARVIS_COMMAND_BAR_HOTKEY",), "Stop hotkey": ("JARVIS_STOP_HOTKEY",),
+    "Start with Windows": ("startup",),
     "Ask before taking control": ("JARVIS_CONFIRM_ACTIONS",), "Safe mode": ("JARVIS_SAFE_MODE",),
     "Vision provider": ("JARVIS_VISION_PROVIDER",), "Vision model": ("JARVIS_VISION_MODEL",),
     "Start Ollama with JARVIS": ("JARVIS_OLLAMA_AUTOSTART",), "Ollama vision model": ("OLLAMA_VISION_MODEL",),
@@ -316,10 +317,11 @@ class SettingsDialog(QDialog):
                                  ("vosk-model-small-en-us-0.15", "US English — small (40 MB)")], Config.VOSK_MODEL_NAME)
 
         from core.buddy import HOTKEYS
-        from core.hotkeys import COMMAND_BAR_HOTKEYS
+        from core.hotkeys import COMMAND_BAR_HOTKEYS, STOP_HOTKEYS
         self.buddy = ToggleSwitch(Config.BUDDY_ENABLED)
         self.buddy_hotkey = _combo(list(HOTKEYS.items()), Config.BUDDY_HOTKEY)
         self.bar_hotkey = _combo(list(COMMAND_BAR_HOTKEYS.items()), Config.COMMAND_BAR_HOTKEY)
+        self.stop_hotkey = _combo(list(STOP_HOTKEYS.items()), Config.STOP_HOTKEY)
         from core import autostart
         self.startup = ToggleSwitch(autostart.is_enabled())
         self._startup_initial = self.startup.isChecked()
@@ -339,7 +341,7 @@ class SettingsDialog(QDialog):
 
         for w in (self.default_model, self.timeout, self.engine, self.laya_model, self.tts, self.voice_name, self.rate,
                   self.wake_word, self.act_mode, self.stt_model, self.buddy_hotkey, self.bar_hotkey,
-                  self.vision_provider, self.vision_model, self.ollama_vision, self.location_edit):
+                  self.stop_hotkey, self.vision_provider, self.vision_model, self.ollama_vision, self.location_edit):
             sized(w)
 
     # ── layout pieces ─────────────────────────────────────────────────────────
@@ -581,6 +583,12 @@ class SettingsDialog(QDialog):
         self.bar_hotkey.currentTextChanged.connect(self.bar_caps.set_label)
         self._row(card, "Command bar hotkey", "Press anywhere to type a request.", self.bar_hotkey,
                   below=self.bar_caps, keywords="hotkey shortcut command bar type key")
+        card = self._card(page, "Stop")
+        self.stop_caps = KeyCaps(self.stop_hotkey.currentText())
+        self.stop_hotkey.currentTextChanged.connect(self.stop_caps.set_label)
+        self._row(card, "Stop hotkey", "Press anywhere to stop whatever JARVIS is doing. Reminders and alarms "
+                  "stay scheduled.", self.stop_hotkey, below=self.stop_caps,
+                  keywords="hotkey shortcut stop cancel abort emergency panic key")
         card = self._card(page, "Startup")
         self._row(card, "Start with Windows", "Launch JARVIS quietly in the tray when you sign in.", self.startup,
                   keywords="startup autostart boot login sign in tray windows")
@@ -750,7 +758,7 @@ class SettingsDialog(QDialog):
         for w in (self.timeout, self.threshold, self.rate, self.volume):
             w.valueChanged.connect(self._update_dirty)
         for w in (self.engine, self.laya_model, self.tts, self.act_mode, self.stt_model, self.buddy_hotkey,
-                  self.bar_hotkey, self.vision_provider):
+                  self.bar_hotkey, self.stop_hotkey, self.vision_provider):
             w.currentIndexChanged.connect(self._update_dirty)
         for w in (self.live_voice, self.buddy, self.startup, self.confirm, self.safe_mode, self.ollama_autostart):
             w.toggled.connect(self._update_dirty)
@@ -866,6 +874,7 @@ class SettingsDialog(QDialog):
             "JARVIS_BUDDY": "1" if self.buddy.isChecked() else "0",
             "JARVIS_BUDDY_HOTKEY": self.buddy_hotkey.currentData(),
             "JARVIS_COMMAND_BAR_HOTKEY": self.bar_hotkey.currentData(),
+            "JARVIS_STOP_HOTKEY": self.stop_hotkey.currentData(),
             "JARVIS_ACT_MODE": self.act_mode.currentData(),
             "JARVIS_VOSK_MODEL_NAME": self.stt_model.currentData(),
             "JARVIS_CONFIRM_ACTIONS": "1" if self.confirm.isChecked() else "0",

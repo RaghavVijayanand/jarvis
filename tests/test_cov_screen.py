@@ -73,7 +73,9 @@ class Base(unittest.TestCase):
                   patch.object(Config, "SCREENSHOTS_DIR", self.tmp),
                   patch.object(Config, "AUTOMATION_ACTION_DELAY", 0),
                   patch.object(Config, "AUTOMATION_CONFIRMATION_REQUIRED", True),
-                  patch.object(sa, "_install_emergency_stop", lambda cb: None)):
+                  patch.object(sa, "_install_emergency_stop", lambda cb: None),
+                  # the real desktop's front window must not decide test outcomes
+                  patch.object(ScreenAutomationSkill, "_foreground_window", staticmethod(lambda: 1))):
             p.start()
             self.addCleanup(p.stop)
         self.jarvis = Mock(decision=None)

@@ -202,10 +202,11 @@ class Tray(QObject):
     buddy_toggled = Signal(bool)
     voice_toggled = Signal(bool)
     startup_toggled = Signal(bool)
+    stop = Signal()
     quit = Signal()
 
-    ICONS = {"ask": "sparkle", "dash": "home", "buddy": "cursor", "voice": "mic", "startup": "power",
-             "settings": "gear", "quit": "close"}
+    ICONS = {"ask": "sparkle", "dash": "home", "stop": "stop", "buddy": "cursor", "voice": "mic",
+             "startup": "power", "settings": "gear", "quit": "close"}
 
     def __init__(self, bar_hotkey: str = "", parent=None):
         super().__init__(parent)
@@ -241,6 +242,12 @@ class Tray(QObject):
         self.act_voice.toggled.connect(self.voice_toggled.emit)
         self.act_startup = action("Start with Windows", "startup", checkable=True)
         self.act_startup.toggled.connect(self.startup_toggled.emit)
+        from core.config import Config
+        from core.hotkeys import STOP_HOTKEYS
+        stop_key = STOP_HOTKEYS.get(Config.STOP_HOTKEY, "")
+        self.act_stop = action(f"Stop everything\t{stop_key}" if stop_key else "Stop everything", "stop")
+        self.act_stop.setToolTip("Stop whatever JARVIS is doing now (reminders and alarms stay scheduled)")
+        self.act_stop.triggered.connect(self.stop.emit)
         self.act_settings = action("Settings…", "settings")
         self.act_settings.triggered.connect(self.settings.emit)
         self.act_quit = action("Quit JARVIS", "quit", color=theme.MUTED)
@@ -251,8 +258,8 @@ class Tray(QObject):
             act.toggled.connect(lambda _on, a=act: self._label_toggle(a))
             self._label_toggle(act)
         menu.addAction(self.act_header)
-        for item in (self.act_ask, self.act_dash, None, self.act_buddy, self.act_voice, self.act_startup, None,
-                     self.act_settings, self.act_quit):
+        for item in (self.act_ask, self.act_dash, self.act_stop, None, self.act_buddy, self.act_voice,
+                     self.act_startup, None, self.act_settings, self.act_quit):
             menu.addSeparator() if item is None else menu.addAction(item)
         self.menu = menu
         self.icon.setContextMenu(menu)

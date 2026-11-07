@@ -251,6 +251,9 @@ class CommandBarTests(unittest.TestCase):
     def setUp(self):
         qapp()
         from ui.command_bar import CommandBar
+        front = patch.object(CommandBar, "_bring_to_front")    # real ALT tap + SetForegroundWindow
+        front.start()
+        self.addCleanup(front.stop)
         self.bar = CommandBar("Ctrl + Shift + Space")
         self.addCleanup(self.bar.close)
         self.sent = []
