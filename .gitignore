@@ -9,6 +9,7 @@ __pycache__/
 venv/
 .env
 .env.*
+!.env.example
 
 # OS / IDE
 .DS_Store
@@ -27,6 +28,15 @@ pytest_cache/
 .scrapy/
 
 # Build / Dist
-build/
+build/*
+!build/jarvis.spec
+!build/build_exe.py
+!build/build_installer.py
+!build/make_icon.py
+!build/version_info.txt
 dist/
+_pyibuild/
+_hf_cache/
+_to_delete/
+requirements-ci.txt
 *.egg-info/

@@ -14,17 +14,30 @@ from typing import Dict, List, Optional
 import wmi
 import socket
 
+
 class SystemMonitor:
+    @staticmethod
+    def _system_drive() -> str:
+        """Root of the Windows system drive (not always C:), or '/' elsewhere."""
+        if os.name == 'nt':
+            return os.environ.get('SystemDrive', 'C:').rstrip('\\') + '\\'
+        return '/'
+
+    @staticmethod
+    def _percent(usage) -> float:
+        """Disk usage percent without dividing by zero for empty/virtual volumes."""
+        return (usage.used / usage.total * 100) if usage.total else 0.0
+
     def __init__(self):
         """Initialize system monitoring"""
         self.monitoring_data = {}
-        self.alerts_file = "system_alerts.json"
-        self.performance_log = "performance_log.json"
+        from core.config import Config
+        self.alerts_file = str(Config.DATA_DIR / "system_alerts.json")
         self.wmi_available = True
         
         try:
             self.wmi_interface = wmi.WMI()
-        except:
+        except Exception:
             self.wmi_available = False
         
         # Performance thresholds
@@ -39,6 +52,20 @@ class SystemMonitor:
             'temp_critical': 85
         }
     
+    def _wmi(self, namespace: Optional[str] = None):
+        """Open a WMI connection on the *calling* thread.
+
+        COM objects are apartment-bound: the connection made in __init__ (GUI
+        thread) raises "marshalled for a different thread" when reused from a
+        QThread worker, so every query opens its own connection after
+        CoInitialize()."""
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+        return wmi.WMI(namespace=namespace) if namespace else wmi.WMI()
+
     def get_cpu_info(self) -> Dict:
         """Get CPU usage information"""
         try:
@@ -68,20 +95,6 @@ class SystemMonitor:
         except Exception as e:
             return {'total_gb': 0, 'used_gb': 0, 'available_gb': 0, 'percentage': 0, 'error': str(e)}
     
-    def get_disk_info(self) -> Dict:
-        """Get disk usage information"""
-        try:
-            disk_usage = psutil.disk_usage('C:' if os.name == 'nt' else '/')
-            
-            return {
-                'total_gb': disk_usage.total / (1024**3),
-                'used_gb': disk_usage.used / (1024**3),
-                'free_gb': disk_usage.free / (1024**3),
-                'percentage': (disk_usage.used / disk_usage.total) * 100
-            }
-        except Exception as e:
-            return {'total_gb': 0, 'used_gb': 0, 'free_gb': 0, 'percentage': 0, 'error': str(e)}
-
     def get_system_info(self) -> str:
         """Get basic system information for quick reference"""
         try:
@@ -89,13 +102,11 @@ class SystemMonitor:
             cpu_percent = psutil.cpu_percent(interval=1)
             memory = psutil.virtual_memory()
             
-            # Get disk usage for Windows (use C:)
+            # Disk usage of the system drive
             try:
-                disk_usage = psutil.disk_usage('C:' if os.name == 'nt' else '/')
-                disk_percent = (disk_usage.used / disk_usage.total * 100)
-            except:
+                disk_percent = self._percent(psutil.disk_usage(self._system_drive()))
+            except Exception:
                 disk_percent = 0
-                disk_usage = None
             
             # Get system uptime
             boot_time = psutil.boot_time()
@@ -118,107 +129,19 @@ Processes: {len(psutil.pids())}"""
         except Exception as e:
             return f"Error getting system info: {str(e)}"
     
-    def _format_bytes(self, bytes_value):
-        """Format bytes to human readable format"""
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if bytes_value < 1024.0:
-                return f"{bytes_value:.2f} {unit}"
-            bytes_value /= 1024.0
-        return f"{bytes_value:.2f} PB"
-    
-    def get_detailed_system_info(self) -> str:
-        """Get comprehensive system information"""
-        try:
-            info = []
-            
-            # Basic system info
-            info.append("=== SYSTEM INFORMATION ===")
-            info.append(f"OS: {platform.system()} {platform.release()}")
-            info.append(f"Architecture: {platform.architecture()[0]}")
-            info.append(f"Processor: {platform.processor()}")
-            info.append(f"Machine: {platform.machine()}")
-            info.append(f"Node: {platform.node()}")
-            
-            # CPU Information
-            info.append("\n=== CPU INFORMATION ===")
-            info.append(f"Physical cores: {psutil.cpu_count(logical=False)}")
-            info.append(f"Total cores: {psutil.cpu_count(logical=True)}")
-            
-            # Get CPU frequencies
-            cpu_freq = psutil.cpu_freq()
-            if cpu_freq:
-                info.append(f"Max Frequency: {cpu_freq.max:.2f}Mhz")
-                info.append(f"Min Frequency: {cpu_freq.min:.2f}Mhz")
-                info.append(f"Current Frequency: {cpu_freq.current:.2f}Mhz")
-            
-            # CPU usage per core
-            cpu_usage = psutil.cpu_percent(interval=1, percpu=True)
-            info.append("CPU Usage Per Core:")
-            for i, percentage in enumerate(cpu_usage):
-                info.append(f"  Core {i}: {percentage}%")
-            
-            # Memory Information
-            info.append("\n=== MEMORY INFORMATION ===")
-            memory = psutil.virtual_memory()
-            info.append(f"Total: {self._format_bytes(memory.total)}")
-            info.append(f"Available: {self._format_bytes(memory.available)}")
-            info.append(f"Used: {self._format_bytes(memory.used)} ({memory.percent}%)")
-            info.append(f"Free: {self._format_bytes(memory.free)}")
-            
-            # Swap memory
-            swap = psutil.swap_memory()
-            if swap.total > 0:
-                info.append(f"Swap Total: {self._format_bytes(swap.total)}")
-                info.append(f"Swap Used: {self._format_bytes(swap.used)} ({swap.percent}%)")
-            
-            # Disk Information
-            info.append("\n=== DISK INFORMATION ===")
-            partitions = psutil.disk_partitions()
-            for partition in partitions:
-                info.append(f"Device: {partition.device}")
-                info.append(f"  Mountpoint: {partition.mountpoint}")
-                info.append(f"  File system: {partition.fstype}")
-                
-                try:
-                    partition_usage = psutil.disk_usage(partition.mountpoint)
-                    info.append(f"  Total Size: {self._format_bytes(partition_usage.total)}")
-                    info.append(f"  Used: {self._format_bytes(partition_usage.used)}")
-                    info.append(f"  Free: {self._format_bytes(partition_usage.free)}")
-                    info.append(f"  Percentage: {partition_usage.used / partition_usage.total * 100:.1f}%")
-                except PermissionError:
-                    info.append("  Permission Denied")
-                info.append("")
-            
-            # Network Information
-            info.append("=== NETWORK INFORMATION ===")
-            network_info = psutil.net_if_addrs()
-            for interface_name, interface_addresses in network_info.items():
-                info.append(f"Interface: {interface_name}")
-                for address in interface_addresses:
-                    if str(address.family) == 'AddressFamily.AF_INET':
-                        info.append(f"  IP Address: {address.address}")
-                        info.append(f"  Netmask: {address.netmask}")
-                        info.append(f"  Broadcast IP: {address.broadcast}")
-                    elif str(address.family) == 'AddressFamily.AF_PACKET':
-                        info.append(f"  MAC Address: {address.address}")
-                        info.append(f"  Netmask: {address.netmask}")
-                        info.append(f"  Broadcast MAC: {address.broadcast}")
-                info.append("")
-            
-            return "\n".join(info)
-            
-        except Exception as e:
-            return f"Error getting system information: {e}"
-    
     def get_performance_metrics(self) -> Dict:
         """Get current performance metrics"""
         try:
+            # One 1-second sample serves both the total and per-core figures
+            # (previously two back-to-back blocking samples).
+            per_core = psutil.cpu_percent(interval=1, percpu=True) or []
+            cpu_freq = psutil.cpu_freq()
             metrics = {
                 'timestamp': datetime.now().isoformat(),
                 'cpu': {
-                    'usage_percent': psutil.cpu_percent(interval=1),
-                    'usage_per_core': psutil.cpu_percent(interval=1, percpu=True),
-                    'frequency': psutil.cpu_freq()._asdict() if psutil.cpu_freq() else None,
+                    'usage_percent': (sum(per_core) / len(per_core)) if per_core else psutil.cpu_percent(interval=None),
+                    'usage_per_core': per_core,
+                    'frequency': cpu_freq._asdict() if cpu_freq else None,
                     'load_average': os.getloadavg() if hasattr(os, 'getloadavg') else None
                 },
                 'memory': {
@@ -237,15 +160,20 @@ Processes: {len(psutil.pids())}"""
             
             # Disk usage for each partition
             for partition in psutil.disk_partitions():
+                opts = (partition.opts or '').split(',')
+                # An inserted DVD (opts "cdrom") or read-only image is always
+                # "100% full"; don't raise critical disk alerts for it.
+                if 'cdrom' in opts or 'ro' in opts:
+                    continue
                 try:
                     usage = psutil.disk_usage(partition.mountpoint)
                     metrics['disk'][partition.device] = {
                         'total': usage.total,
                         'used': usage.used,
                         'free': usage.free,
-                        'percent': (usage.used / usage.total) * 100
+                        'percent': self._percent(usage)
                     }
-                except:
+                except Exception:  # empty card reader / CD drive, access denied
                     continue
             
             # Network I/O
@@ -253,9 +181,11 @@ Processes: {len(psutil.pids())}"""
             if net_io:
                 metrics['network']['io'] = net_io._asdict()
             
-            # Network connections
-            connections = len(psutil.net_connections())
-            metrics['network']['connections'] = connections
+            # Network connections (may need elevation on some systems)
+            try:
+                metrics['network']['connections'] = len(psutil.net_connections())
+            except (psutil.AccessDenied, OSError):
+                pass
             
             return metrics
             
@@ -265,17 +195,31 @@ Processes: {len(psutil.pids())}"""
     def _get_top_processes(self, limit: int = 10) -> List[Dict]:
         """Get top processes by CPU usage"""
         try:
-            processes = []
-            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'status']):
+            # Process.cpu_percent() returns a meaningless 0.0 on its first call,
+            # so prime every process, wait, then read the real figure.
+            procs = []
+            for proc in psutil.process_iter(['pid', 'name', 'memory_percent', 'status']):
                 try:
-                    proc_info = proc.info
-                    proc_info['cpu_percent'] = proc.cpu_percent()
+                    if proc.info.get('pid') == 0:  # Windows "System Idle Process"
+                        continue
+                    proc.cpu_percent(None)
+                    procs.append(proc)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            time.sleep(0.5)
+            cores = psutil.cpu_count() or 1
+            processes = []
+            for proc in procs:
+                try:
+                    proc_info = dict(proc.info)
+                    proc_info['name'] = proc_info.get('name') or f"PID {proc_info.get('pid')}"
+                    # Normalise to 0-100% of the whole machine (Task Manager style).
+                    proc_info['cpu_percent'] = (proc.cpu_percent(None) or 0.0) / cores
                     processes.append(proc_info)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
-            
-            # Sort by CPU usage
-            processes.sort(key=lambda x: x.get('cpu_percent', 0), reverse=True)
+
+            processes.sort(key=lambda x: x.get('cpu_percent') or 0, reverse=True)
             return processes[:limit]
             
         except Exception:
@@ -359,7 +303,7 @@ Processes: {len(psutil.pids())}"""
                     if temp_info:
                         health_report.append("System Temperature:")
                         health_report.append(f"  {temp_info}")
-                except:
+                except Exception:
                     pass
             
             # Uptime
@@ -390,12 +334,13 @@ Processes: {len(psutil.pids())}"""
             
             if not self.wmi_available:
                 return "WMI not available - limited hardware information possible"
-            
+
+            conn = self._wmi()
             hardware_info.append("=== HARDWARE INFORMATION ===")
             
             # CPU Information
             hardware_info.append("\n--- CPU ---")
-            for cpu in self.wmi_interface.Win32_Processor():
+            for cpu in conn.Win32_Processor():
                 hardware_info.append(f"Name: {cpu.Name}")
                 hardware_info.append(f"Manufacturer: {cpu.Manufacturer}")
                 hardware_info.append(f"Architecture: {cpu.Architecture}")
@@ -407,8 +352,8 @@ Processes: {len(psutil.pids())}"""
             # Memory Information
             hardware_info.append("\n--- MEMORY ---")
             total_capacity = 0
-            for memory in self.wmi_interface.Win32_PhysicalMemory():
-                capacity_gb = int(memory.Capacity) / (1024**3)
+            for memory in conn.Win32_PhysicalMemory():
+                capacity_gb = int(memory.Capacity or 0) / (1024**3)
                 total_capacity += capacity_gb
                 hardware_info.append(f"Capacity: {capacity_gb:.1f} GB")
                 hardware_info.append(f"Speed: {memory.Speed} MHz")
@@ -421,7 +366,7 @@ Processes: {len(psutil.pids())}"""
             
             # Motherboard Information
             hardware_info.append("\n--- MOTHERBOARD ---")
-            for board in self.wmi_interface.Win32_BaseBoard():
+            for board in conn.Win32_BaseBoard():
                 hardware_info.append(f"Manufacturer: {board.Manufacturer}")
                 hardware_info.append(f"Product: {board.Product}")
                 hardware_info.append(f"Version: {board.Version}")
@@ -429,7 +374,7 @@ Processes: {len(psutil.pids())}"""
             
             # Graphics Information
             hardware_info.append("\n--- GRAPHICS ---")
-            for gpu in self.wmi_interface.Win32_VideoController():
+            for gpu in conn.Win32_VideoController():
                 if gpu.Name:
                     hardware_info.append(f"Name: {gpu.Name}")
                     if gpu.AdapterRAM:
@@ -440,7 +385,7 @@ Processes: {len(psutil.pids())}"""
             
             # Storage Information
             hardware_info.append("--- STORAGE ---")
-            for disk in self.wmi_interface.Win32_DiskDrive():
+            for disk in conn.Win32_DiskDrive():
                 if disk.Size:
                     size_gb = int(disk.Size) / (1024**3)
                     hardware_info.append(f"Model: {disk.Model}")
@@ -461,88 +406,22 @@ Processes: {len(psutil.pids())}"""
                 return None
             
             temps = []
-            for temp_sensor in self.wmi_interface.MSAcpi_ThermalZoneTemperature():
+            # MSAcpi_ThermalZoneTemperature lives in root\\wmi, not the default
+            # root\\cimv2 namespace (and usually needs an elevated process).
+            for temp_sensor in self._wmi(namespace="root\\wmi").MSAcpi_ThermalZoneTemperature():
+                if not temp_sensor.CurrentTemperature:
+                    continue
                 # Convert from tenths of Kelvin to Celsius
                 temp_celsius = temp_sensor.CurrentTemperature / 10.0 - 273.15
                 temps.append(f"{temp_celsius:.1f}°C")
-            
+
             if temps:
                 return " | ".join(temps)
-            
-        except:
+
+        except Exception:
             pass
         
         return None
-    
-    def monitor_performance(self, duration_minutes: int = 5) -> str:
-        """Monitor system performance over time"""
-        try:
-            samples = []
-            interval = 30  # seconds
-            total_samples = (duration_minutes * 60) // interval
-            
-            for i in range(total_samples):
-                sample = {
-                    'timestamp': datetime.now().isoformat(),
-                    'cpu_percent': psutil.cpu_percent(interval=1),
-                    'memory_percent': psutil.virtual_memory().percent,
-                    'disk_usage': {}
-                }
-                
-                # Sample disk usage for main drives
-                for partition in psutil.disk_partitions()[:2]:  # Limit to first 2 drives
-                    try:
-                        usage = psutil.disk_usage(partition.mountpoint)
-                        sample['disk_usage'][partition.device] = (usage.used / usage.total) * 100
-                    except:
-                        continue
-                
-                samples.append(sample)
-                
-                if i < total_samples - 1:  # Don't sleep on last iteration
-                    time.sleep(interval)
-            
-            # Analyze samples
-            if not samples:
-                return "No performance data collected"
-            
-            avg_cpu = sum(s['cpu_percent'] for s in samples) / len(samples)
-            max_cpu = max(s['cpu_percent'] for s in samples)
-            avg_memory = sum(s['memory_percent'] for s in samples) / len(samples)
-            max_memory = max(s['memory_percent'] for s in samples)
-            
-            report = []
-            report.append(f"=== PERFORMANCE MONITORING REPORT ===")
-            report.append(f"Duration: {duration_minutes} minutes")
-            report.append(f"Samples: {len(samples)}")
-            report.append("")
-            report.append(f"CPU Usage:")
-            report.append(f"  Average: {avg_cpu:.1f}%")
-            report.append(f"  Maximum: {max_cpu:.1f}%")
-            report.append("")
-            report.append(f"Memory Usage:")
-            report.append(f"  Average: {avg_memory:.1f}%")
-            report.append(f"  Maximum: {max_memory:.1f}%")
-            
-            # Save detailed data
-            log_data = {
-                'timestamp': datetime.now().isoformat(),
-                'duration_minutes': duration_minutes,
-                'samples': samples,
-                'summary': {
-                    'avg_cpu': avg_cpu,
-                    'max_cpu': max_cpu,
-                    'avg_memory': avg_memory,
-                    'max_memory': max_memory
-                }
-            }
-            
-            self._save_performance_log(log_data)
-            
-            return "\n".join(report)
-            
-        except Exception as e:
-            return f"Error monitoring performance: {e}"
     
     def _format_bytes(self, bytes_value: int) -> str:
         """Format bytes to human readable format"""
@@ -579,8 +458,13 @@ Processes: {len(psutil.pids())}"""
             # Load existing alerts
             existing_alerts = []
             if os.path.exists(self.alerts_file):
-                with open(self.alerts_file, 'r') as f:
-                    existing_alerts = json.load(f)
+                try:
+                    with open(self.alerts_file, 'r', encoding='utf-8') as f:
+                        existing_alerts = json.load(f)
+                except (OSError, ValueError):
+                    existing_alerts = []  # corrupt log: start over, don't fail forever
+                if not isinstance(existing_alerts, list):
+                    existing_alerts = []
             
             # Add new alerts
             existing_alerts.append(alert_data)
@@ -589,33 +473,11 @@ Processes: {len(psutil.pids())}"""
             existing_alerts = existing_alerts[-100:]
             
             # Save back to file
-            with open(self.alerts_file, 'w') as f:
-                json.dump(existing_alerts, f, indent=2)
+            with open(self.alerts_file, 'w', encoding='utf-8') as f:
+                json.dump(existing_alerts, f, indent=2, ensure_ascii=False)
                 
         except Exception as e:
             print(f"Error saving alerts: {e}")
-    
-    def _save_performance_log(self, log_data: Dict):
-        """Save performance monitoring data"""
-        try:
-            # Load existing logs
-            existing_logs = []
-            if os.path.exists(self.performance_log):
-                with open(self.performance_log, 'r') as f:
-                    existing_logs = json.load(f)
-            
-            # Add new log
-            existing_logs.append(log_data)
-            
-            # Keep only last 50 logs
-            existing_logs = existing_logs[-50:]
-            
-            # Save back to file
-            with open(self.performance_log, 'w') as f:
-                json.dump(existing_logs, f, indent=2)
-                
-        except Exception as e:
-            print(f"Error saving performance log: {e}")
     
     def get_network_analysis(self) -> str:
         """Get detailed network analysis"""
@@ -624,7 +486,11 @@ Processes: {len(psutil.pids())}"""
             analysis.append("=== NETWORK ANALYSIS ===")
             
             # Active connections
-            connections = psutil.net_connections()
+            try:
+                connections = psutil.net_connections()
+            except (psutil.AccessDenied, OSError):
+                connections = []
+                analysis.append("(Connection list unavailable - access denied)")
             tcp_count = sum(1 for conn in connections if conn.type == socket.SOCK_STREAM)
             udp_count = sum(1 for conn in connections if conn.type == socket.SOCK_DGRAM)
             
@@ -632,10 +498,10 @@ Processes: {len(psutil.pids())}"""
             analysis.append(f"  TCP: {tcp_count}")
             analysis.append(f"  UDP: {udp_count}")
             
-            # Connection states
+            # Connection states (UDP sockets report the placeholder "NONE")
             states = {}
             for conn in connections:
-                if hasattr(conn, 'status'):
+                if getattr(conn, 'status', None) and conn.status != psutil.CONN_NONE:
                     states[conn.status] = states.get(conn.status, 0) + 1
             
             if states:

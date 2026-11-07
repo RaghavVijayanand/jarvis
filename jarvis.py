@@ -1,59 +1,49 @@
 #!/usr/bin/env python3
 """
-JARVIS - AI Assistant
-Inspired by Tony Stark's AI from Iron Man
+JARVIS — desktop AI assistant for Windows.
 
-A sophisticated AI assistant with text-to-speech, natural language processing,
-system control, and various intelligent capabilities.
+Pipeline for every message:
+  1. lifecycle words (exit / sleep / wake) and pending confirmations;
+  2. deterministic file syntax (create/read/rename … and overwrite prompts);
+  3. local decision model (Laya, with rule fallback) picks an intent — no LLM call;
+  4. compound requests are split into ordered steps and executed one by one;
+  5. a skill handler answers; anything it can't handle goes to the language
+     model, which can act through the single shared tool registry.
+Destructive actions always need an explicit "yes".
 """
 
+import os
+import random
+import re
+import sys
 import threading
 import time
-import signal
-import sys
-import os
 from datetime import datetime
-import random
 
-# Rich console for beautiful output
+# Consoles that cannot encode Unicode (e.g. cp1252 when output is piped)
+# must degrade to replacement characters instead of crashing the app.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
-from rich.layout import Layout
-from rich.live import Live
 from rich import box
 
-# Core JARVIS modules
-from config import Config
+from core.config import Config
+from core.logging_setup import setup_logging, get_logger
+from core.decision import DecisionEngine, PERSONAL_FACT_QUESTION
+from core.tools import ToolRegistry
+from core.voice import VoiceEngine
+from core.brain import MultiModelBrain
 
-# Global flag for agent availability
-AGENT_AVAILABLE = False
-
-# Attempt to import the autonomous agent orchestrator
-try:
-   from agent_orchestrator import AgentOrchestrator
-   AGENT_AVAILABLE = True
-except Exception as _:
-   AGENT_AVAILABLE = False
-
-from voice_engine import VoiceEngine
-from brain import AIBrain
-from openrouter_brain import OpenRouterBrain
-
-# Multi-model AI brain
-try:
-    from multi_model_brain import MultiModelBrain
-    MULTI_MODEL_AVAILABLE = True
-except Exception as e:
-    MULTI_MODEL_AVAILABLE = False
-    print(f"Multi-model brain not available: {e}")
-
-from system_control import SystemControl
-
-# Skills
+from skills.system_control import SystemControl
 from skills.weather import WeatherSkill
 from skills.web_search import WebSearchSkill
-from skills.web_scraper import WebScraperSkill
 from skills.utility import UtilitySkill
 from skills.file_manager import FileManagerSkill
 from skills.automation import AutomationSkill
@@ -62,2372 +52,1135 @@ from skills.command_processor import CommandProcessor
 from skills.task_scheduler import TaskScheduler
 from skills.system_monitor import SystemMonitor
 from skills.screen_automation import ScreenAutomationSkill
+from skills.windows_control import WindowsControl
+from skills.software_manager import SoftwareManager
+from skills.system_admin import SystemAdmin
+from skills.app_scripting import AppScripting
+from skills.network_manager import NetworkManager
+from skills.service_manager import ServiceManager
+from skills.power_manager import PowerManager
+from skills.productivity import ProductivitySkill
+from skills.security_checks import SecurityChecks
+from skills.window_layouts import WindowLayouts
+from skills.outlook_manager import OutlookManager
+from skills.watchers import WatcherManager
+from skills.file_index import FileIndex
+from skills.web_dashboard import WebDashboard
 
 console = Console()
+log = get_logger("jarvis")
+_ORIGIN = threading.local()          # per-thread: is this command from live voice?
+
+# Words that point back at the conversation ("type it there", "close that", "play it again").
+_FOLLOW_UP = re.compile(
+    r"\b(?:it|its|that|this|these|those|them|there|again|same|instead|another one|one more|the other one|"
+    r"the previous one|the last one|undo|shorter|longer)\b|"
+    r"^\s*(?:and|also|now|then|but|actually|ok so|okay so|what about|how about|continue|keep going|go on)\b",
+    re.I)
+# Fixed phrases where "it"/"this" refer to nothing earlier.
+_IDIOMS = re.compile(r"what time is it|is it (?:going to|gonna)|how(?:'s| is) it going|what(?:'s| is) it like|"
+                     r"(?:this|that) (?:morning|afternoon|evening|week|month|year|weekend)|this is|that's all",
+                     re.I)
+_FOLLOW_UP_WINDOW = 30 * 60          # seconds: older turns aren't "the conversation" any more
+# "close it", "minimise that", "go back to it": the app is the one JARVIS opened last (or the one in front).
+_APP_REFERENCE = re.compile(
+    r"^(?P<verb>close|quit|exit|minimi[sz]e|maximi[sz]e|restore|focus|switch to|switch back to|go back to|"
+    r"bring back|back to)\s+(?:it|that|this|that app|this app|that window|this window|that one|this one)"
+    r"(?:\s+again)?$", re.I)
+# "what about mumbai?" right after a weather question.
+_WHAT_ABOUT = re.compile(r"^(?:and\s+)?(?:what|how)\s+about\s+(?:in\s+)?(?P<x>[a-z][a-z .'-]{1,40}?)\??$", re.I)
+
+# Decision-model labels → handler categories.
+INTENT_MAP = {
+    "chat": "GENERAL", "time": "TIME", "math": "MATH", "weather": "WEATHER", "search": "SEARCH",
+    "open": "APP", "media": "MEDIA", "system": "SYSTEM", "control": "CONTROL", "file": "FILE",
+    "schedule": "SCHEDULE", "screen": "SCREEN_AUTOMATION", "memory": "MEMORY", "fun": "UTILITY",
+    "software": "SOFTWARE", "appscript": "APPSCRIPT", "network": "NETWORK", "service": "SERVICE",
+    "power": "POWER", "productivity": "PRODUCTIVITY", "security": "SECURITY", "layout": "LAYOUT",
+    "email": "EMAIL", "watch": "WATCH", "fileindex": "FILEINDEX", "dashboard": "DASHBOARD", "plugins": "PLUGINS",
+}
+
+HELP_TEXT = """Here's what I can do:
+• Chat & questions — anything; I remember facts you tell me ("remember that I like tea").
+• Apps & web — "open Spotify", "close Chrome", "go to YouTube and play lo-fi", "open github.com".
+• Media & volume — "pause", "next track", "volume 40", "mute", "what's playing".
+• PC control — "lock my PC", "show desktop", "minimize Chrome", "open Bluetooth settings", "brightness 60".
+• Power — "restart the computer", "shut down", "put the PC to sleep" (I always ask first).
+• Files — "create file notes/todo.txt with content buy milk", "read file todo", "rename a.txt to b.txt".
+• Time & reminders — "what time is it", "set an alarm for 7 am", "remind me to stretch in 20 minutes".
+• Info — "weather in London", "search for Python 3.14 news", "CPU usage", "battery".
+• Screen — "take a screenshot", "what's on my screen", "click the Save button", "type hello".
+• Software — "install VLC", "uninstall notepad++", "update all apps", "is Python installed".
+• Admin — registry, firewall rules and OS scheduled tasks, just ask in plain language (I'll confirm first).
+• Blender — "model a chair in Blender" (I write the script with AI and run it — I'll confirm first).
+• Services & processes — "what's using my CPU", "list services", "restart the spooler service".
+• Power & startup — "list power plans", "switch power plan to balanced", "disable Spotify from startup".
+• Productivity — "clipboard history", "what does my screen say", "read the pdf report.pdf".
+• Security — "defender status", "bitlocker status", "check for windows updates" (I'll confirm before scanning/installing).
+• Window layouts — "save the current layout as work", "restore layout work", "snap Chrome to left-half".
+• Outlook — "list my recent emails", "what's on my calendar", "send an email to..." (I'll confirm before sending).
+• Watchers — "tell me when setup.exe appears", "notify me if CPU stays above 90 for 2 minutes", "list watchers".
+• File search — "index folder C:\\Docs", "search my files for Q3 budget", "file index status".
+• Remote dashboard — "start the dashboard" gives you a link to control JARVIS from your phone on the same Wi-Fi.
+• Plugins — "list plugins" shows what's loaded; drop a .py file in the plugins folder to add a capability.
+• Multi-step — "open Notepad, type hello, then press ctrl+s".
+• Models — "list models", "switch model gemini-flash", "benchmark models", "decision status".
+• JARVIS itself — "sleep" / "wake up" pauses and resumes me; "exit" closes me.
+Say "help" any time to see this again."""
+
+_YES = re.compile(r"(yes|yeah|yep|yup|y|sure|confirm|do it|go ahead|ok do it|okay do it)"
+                  r"(,?\s*(please|do it|go ahead|confirm))?")
+_NO = re.compile(r"(no|nope|n|cancel|stop|don't|do not|never mind|nevermind)(,?\s*(thanks|thank you|cancel))?")
+_CONFIRM_TTL = 120      # seconds a queued destructive action waits for its yes
+# Plan lanes queue confirmations while the GUI worker, live voice and the web dashboard may each be
+# answering: without one lock two simultaneous "yes" both pop, and the second approves an action
+# nobody said yes to.
+_PENDING_LOCK = threading.RLock()
+_MAX_PLAN_STEPS = 25
+
+
+class _NullVoice:
+    """Stand-in when the voice engine can't start: speaking and listening do nothing."""
+    sr_available = False
+    tts_available = False
+    selected_mic_index = None
+
+    def speak(self, *args, **kwargs):
+        return None
+
+    def listen_for_command(self, *args, **kwargs):
+        return None
+
+    def listen_for_wake_word(self, *args, **kwargs):
+        return False
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
 
 class JARVIS:
-    def __init__(self):
-        """Initialize JARVIS AI Assistant"""
-        
-        # Display startup banner
-        self.display_startup_banner()
-        
-        # Initialize core components
+    def __init__(self, show_banner: bool = True):
+        setup_logging()
+        if show_banner:
+            self.display_startup_banner()
         console.print("[yellow]Initializing JARVIS systems...[/yellow]")
-        
-        self.voice_engine = VoiceEngine()
-        
-        # Initialize AI brains - Enhanced multi-model support
-        self.use_multi_model = Config.USE_MULTI_MODEL and MULTI_MODEL_AVAILABLE
-        
-        if self.use_multi_model:
-            try:
-                self.multi_brain = MultiModelBrain()
-                if self.multi_brain.available_models:
-                    console.print(f"[green]🧠 Multi-model AI initialized with {len(self.multi_brain.available_models)} models[/green]")
-                    console.print(f"[green]Current model: {self.multi_brain.current_model}[/green]")
-                    self.brain_type = "multi_model"
-                    # Compatibility alias for existing code
-                    self.brain = self.multi_brain
-                    self.use_advanced_brain = True
-                else:
-                    self.use_multi_model = False
-                    console.print("[yellow]Multi-model brain has no available models, falling back[/yellow]")
-            except Exception as e:
-                console.print(f"[yellow]Multi-model brain failed: {e}[/yellow]")
-                self.use_multi_model = False
-        
-        if not self.use_multi_model:
-            # Fallback to original brain system
-            self.brain = AIBrain()
-            self.use_advanced_brain = Config.USE_OPENROUTER
-            
-            if self.use_advanced_brain:
-                self.openrouter_brain = OpenRouterBrain()
-                if not self.openrouter_brain.available:
-                    console.print("[yellow]OpenRouter not available, falling back to native brain[/yellow]")
-                    console.print("[dim]This could be due to network issues, API service downtime, or invalid API key[/dim]")
-                    self.use_advanced_brain = False
-                    self.brain_type = "native"
-                else:
-                    console.print("[green]Using OpenRouter with Qwen model[/green]")
-                    self.brain_type = "openrouter"
-            
-            if not self.use_advanced_brain:
-                console.print("[yellow]Using native AI brain - no external APIs required.[/yellow]")
-                self.brain_type = "native"
-        
-        self.system_control = SystemControl()
-        
-        # Initialize skills
+
+        # Callbacks the GUI (or CLI) can install.
+        self.confirm_callback = None      # fn(question) -> bool, may block
+        self.notify_callback = None       # fn(text) — show proactive messages
+        self.exit_callback = None         # fn() — GUI closes itself
+        self.voice_output_enabled = False  # GUI voice toggle (scheduler reminders honour it)
+        self._voice_mode = False
+        self._console_mode = False
+        self._pending_actions = []           # destructive actions waiting for "yes" (oldest first)
+        self._last_decision = None
+        self._stop_plan = threading.Event()
+        self._input_lock = threading.Lock()   # steps that press keys / move focus take turns
+        self._active_session = None
+        self._resolution_timer = None
+        self.stream = None                    # live voice session (core/streaming.py) when active
+        self._live_listener = None
+
+        self.voice_engine = self._safe(lambda: VoiceEngine(), "Voice engine") or _NullVoice()
+
+        try:
+            self.decision = DecisionEngine(engine=Config.DECISION_ENGINE, model=Config.LAYA_MODEL,
+                                           repo=Config.LAYA_REPO, threshold=Config.DECISION_THRESHOLD,
+                                           on_status=lambda s: log.info("decision: %s", s))
+        except Exception as e:
+            log.exception("decision engine failed")
+            console.print(f"[yellow]⚠️ Local decision model unavailable ({e}); using rules.[/yellow]")
+            self.decision = DecisionEngine(engine="rules")
+
+        try:
+            self.brain = MultiModelBrain()
+            n = len(self.brain.available_models)
+            console.print(f"[green]🧠 AI initialized — {n} model(s) available[/green]")
+            if not self.brain.current_model:
+                console.print("[yellow]No AI model yet — add an API key in Settings or install Ollama.[/yellow]")
+        except Exception as e:
+            log.exception("brain failed")
+            console.print(f"[red]AI brain failed to start: {e}[/red]")
+            self.brain = None
+        self.multi_brain = self.brain
+
+        self.app_control = self._safe(lambda: ApplicationControl(), "Application control")
+        self.system_control = SystemControl(app_control=self.app_control)
+        self.windows = WindowsControl()
         self.weather_skill = WeatherSkill()
         self.web_skill = WebSearchSkill()
         self.utility_skill = UtilitySkill()
         self.file_skill = FileManagerSkill()
-        # Initialize automation and app control skills
-        try:
-            self.automation_skill = AutomationSkill()
-            console.print("[green]✅ Automation system initialized[/green]")
-        except Exception as e:
-            console.print(f"[yellow]⚠️ Automation system failed: {e}[/yellow]")
-            self.automation_skill = None
-        
-        try:
-            self.app_control = ApplicationControl()
-            console.print("[green]✅ Application control initialized[/green]")
-        except Exception as e:
-            console.print(f"[yellow]⚠️ Application control failed: {e}[/yellow]")
-            self.app_control = None
-        
-        # Initialize enhanced skills
-        try:
-            self.command_processor = CommandProcessor(self)
-            console.print("[green]✅ Enhanced command processor initialized[/green]")
-        except Exception as e:
-            console.print(f"[yellow]⚠️ Command processor failed: {e}[/yellow]")
-            self.command_processor = None
-        
-        try:
-            from skills.ai_app_selector import AIAppSelector
-            # Pass the brain to the app selector for AI decision making
-            brain_ref = self.multi_brain if self.use_multi_model else (self.openrouter_brain if self.use_advanced_brain else self.brain)
-            self.ai_app_selector = AIAppSelector(brain=brain_ref)
-            console.print("[green]✅ AI-powered app selector initialized[/green]")
-        except Exception as e:
-            console.print(f"[yellow]⚠️ AI app selector failed: {e}[/yellow]")
-            self.ai_app_selector = None
-        
-        try:
-            self.task_scheduler = TaskScheduler(self)
-            console.print("[green]✅ Task scheduler initialized[/green]")
-        except Exception as e:
-            console.print(f"[yellow]⚠️ Task scheduler failed: {e}[/yellow]")
-            self.task_scheduler = None
-        
-        try:
-            self.system_monitor = SystemMonitor()
-            console.print("[green]✅ Advanced system monitor initialized[/green]")
-        except Exception as e:
-            console.print(f"[yellow]⚠️ System monitor failed: {e}[/yellow]")
-            self.system_monitor = None
-            
-        # Initialize screen automation skill
-        try:
-            self.screen_automation = ScreenAutomationSkill(self)
-            console.print("[green]✅ AI Screen automation initialized[/green]")
-        except Exception as e:
-            console.print(f"[yellow]⚠️ Screen automation failed: {e}[/yellow]")
-            self.screen_automation = None
-            
-        # Track last created or manipulated file for rename operations
-        self.last_created_file = None
-        # Initialize autonomous agent orchestrator if available
-        self.agent_available = AGENT_AVAILABLE
-        if self.agent_available:
-            try:
-                # Pass multi_brain to agent if available
-                multi_brain_ref = self.multi_brain if self.use_multi_model else None
-                self.agent = AgentOrchestrator(self.system_control,
-                                               self.weather_skill,
-                                               self.web_skill,
-                                               self.utility_skill,
-                                               self.file_skill,
-                                               multi_brain=multi_brain_ref)
-            except Exception as e:
-                console.print(f"[yellow]Agent initialization failed: {e}[/yellow]")
-                console.print("[yellow]Falling back to basic brain mode[/yellow]")
-                self.agent_available = False
-        
-        # System state
+        self.automation_skill = self._safe(lambda: AutomationSkill(), "Automation")
+        self.command_processor = CommandProcessor(self)
+        self.system_monitor = self._safe(lambda: SystemMonitor(), "System monitor")
+        self.screen_automation = self._safe(lambda: ScreenAutomationSkill(self), "Screen automation")
+        self.task_scheduler = self._safe(lambda: TaskScheduler(self), "Task scheduler")
+        self.software_manager = self._safe(lambda: SoftwareManager(), "Software manager")
+        self.system_admin = self._safe(lambda: SystemAdmin(), "System admin")
+        self.app_scripting = self._safe(lambda: AppScripting(self), "App scripting")
+        self.network_manager = self._safe(lambda: NetworkManager(), "Network manager")
+        self.service_manager = self._safe(lambda: ServiceManager(), "Service manager")
+        self.power_manager = self._safe(lambda: PowerManager(), "Power manager")
+        self.productivity = self._safe(lambda: ProductivitySkill(self), "Productivity extras")
+        self.security_checks = self._safe(lambda: SecurityChecks(), "Security checks")
+        self.window_layouts = self._safe(lambda: WindowLayouts(self.windows), "Window layouts")
+        self.outlook = self._safe(lambda: OutlookManager(), "Outlook integration")
+        self.watchers = self._safe(lambda: WatcherManager(self), "Watchers")
+        self.file_index = self._safe(lambda: FileIndex(self.productivity), "File index")
+        self.web_dashboard = self._safe(lambda: WebDashboard(self), "Web dashboard")
+
         self.is_running = False
         self.is_sleeping = False
         self.last_activity = time.time()
-        
-        # Create skills dictionary for GUI compatibility
-        self.skills = {
-            'weather': self.weather_skill,
-            'web_search': self.web_skill,
-            'utility': self.utility_skill,
-            'file_manager': self.file_skill,
-            'system_monitor': self.system_monitor,
-        }
-        
-        # Add optional skills if available
-        if hasattr(self, 'automation_skill') and self.automation_skill:
-            self.skills['automation'] = self.automation_skill
-        if hasattr(self, 'app_control') and self.app_control:
-            self.skills['app_control'] = self.app_control
-        if hasattr(self, 'command_processor') and self.command_processor:
-            self.skills['command_processor'] = self.command_processor
-        if hasattr(self, 'task_scheduler') and self.task_scheduler:
-            self.skills['task_scheduler'] = self.task_scheduler
-        if hasattr(self, 'screen_automation') and self.screen_automation:
-            self.skills['screen_automation'] = self.screen_automation
-        if hasattr(self, 'ai_app_selector') and self.ai_app_selector:
-            self.skills['ai_app_selector'] = self.ai_app_selector
-        
-        # Set up signal handlers for graceful shutdown
+
+        self.skills = {name: obj for name, obj in (
+            ("weather", self.weather_skill), ("web_search", self.web_skill), ("utility", self.utility_skill),
+            ("file_manager", self.file_skill), ("system_monitor", self.system_monitor),
+            ("automation", self.automation_skill), ("app_control", self.app_control),
+            ("windows", self.windows), ("command_processor", self.command_processor),
+            ("task_scheduler", self.task_scheduler), ("screen_automation", self.screen_automation),
+            ("software_manager", self.software_manager), ("system_admin", self.system_admin),
+            ("app_scripting", self.app_scripting), ("network_manager", self.network_manager),
+            ("service_manager", self.service_manager), ("power_manager", self.power_manager),
+            ("productivity", self.productivity), ("security_checks", self.security_checks),
+            ("window_layouts", self.window_layouts), ("outlook", self.outlook), ("watchers", self.watchers),
+            ("file_index", self.file_index), ("web_dashboard", self.web_dashboard),
+        ) if obj is not None}
+
+        self.tools = ToolRegistry(confirm=self.confirm)
+        self._register_tools()
+        if self.brain is not None:
+            self.brain.tool_registry = self.tools
+            self.brain.context_provider = self._desktop_context
+            try:
+                self.brain.memory.fact_detector = lambda msg: self.decision.yes_no(msg, PERSONAL_FACT_QUESTION)
+                self.brain.refresh_catalog_async()
+            except Exception:
+                log.exception("brain setup failed")
+        try:
+            self.decision.warm_up_async()
+        except Exception:
+            log.exception("decision warm-up failed")
+        console.print("[green]All systems initialized.[/green]")
+
+    # ── Setup helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _safe(factory, label):
+        try:
+            obj = factory()
+            console.print(f"[green]✅ {label} ready[/green]")
+            return obj
+        except Exception as e:
+            log.exception("%s failed", label)
+            console.print(f"[yellow]⚠️ {label} unavailable: {e}[/yellow]")
+            return None
+
+    def display_startup_banner(self):
+        banner = Text("J.A.R.V.I.S.", style="bold cyan", justify="center")
+        console.print(Panel(banner, title="[bold blue]JARVIS AI Assistant[/bold blue]",
+                            subtitle="[italic]Just A Rather Very Intelligent System[/italic]",
+                            border_style="blue", box=box.DOUBLE))
+        console.print("[dim]Type 'help' to see what I can do.[/dim]")
+
+    def install_signal_handlers(self):
+        """CLI only: Ctrl+C / SIGTERM shut down cleanly (never installed by the GUI)."""
+        import signal
+        if threading.current_thread() is not threading.main_thread():
+            return
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
-        
-        console.print("[green]All systems initialized successfully![/green]")
-        
-    def display_startup_banner(self):
-        """Display JARVIS startup banner"""
-        banner_text = Text()
-        banner_text.append("    ▄▄▄██▀▀▀▄▄▄·  ▄▄▄  ██▒   █▓ ██▓  ██████ \n", "cyan")
-        banner_text.append("      ▒██  ▐█ ▀█ ▀▄ █·▓██░   █▒▓██▒▒██    ▒ \n", "cyan")
-        banner_text.append("      ░██  ▄█▀▀█ ▐▀▀▄  ▓██  █▒░▒██▒░ ▓██▄   \n", "cyan")
-        banner_text.append("   ██▄██▓ ▐█ ▪▐▌▐█•█▌  ▒██ █░░░██░  ▒   ██▒\n", "cyan")
-        banner_text.append("    ▓▀▀▀   ▀  ▀ .▀  ▀   ▒▀█░  ░██░▒██████▒▒\n", "cyan")
-        banner_text.append("                          ░ ▐░  ░▓  ▒ ▒▓▒ ▒ ░\n", "cyan")
-        banner_text.append("                          ░ ░░   ▒ ░░ ░▒  ░ ░\n", "cyan")
-        banner_text.append("                            ░░   ▒ ░░  ░  ░  \n", "cyan")
-        banner_text.append("                             ░   ░        ░  \n", "cyan")
-        
-        banner_panel = Panel(
-            banner_text,
-            title="[bold blue]JARVIS AI Assistant[/bold blue]",
-            subtitle="[italic]Just A Rather Very Intelligent System[/italic]",
-            border_style="blue",
-            box=box.DOUBLE
-        )
-        
-        console.print(banner_panel)
-        console.print()
-        console.print("[italic cyan]\"Sometimes you gotta run before you can walk.\"[/italic cyan] - Tony Stark")
-        console.print()
-        console.print("[bold green]🚀 Enhanced Features Loaded:[/bold green]")
-        console.print("  • Advanced compound command processing")
-        console.print("  • Task scheduling and automation")
-        console.print("  • Detailed system monitoring")
-        console.print("  • Smart file creation with AI content")
-        console.print("  • Background web scraping")
-        console.print()
-        console.print("[dim]Type 'help' or 'what can you do' to see all capabilities[/dim]")
-        console.print()
-    
+
     def signal_handler(self, signum, frame):
-        """Handle shutdown signals gracefully"""
         console.print(f"\n[yellow]Received signal {signum}. Shutting down JARVIS...[/yellow]")
         self.shutdown()
-    
-    def _classify_command_intent(self, command):
-        """Use AI to classify the intent of a command"""
-        try:
-            # Use pure LLM classification without any keyword detection
-            classification_prompt = f"""
-You are JARVIS AI assistant. Classify the user's command into one of these categories:
+        raise SystemExit(0)
 
-AUTOMATION - For opening apps, controlling computer actions, multi-step tasks, visual tasks, screen interactions
-APP - For launching specific applications by name
-WEATHER - For weather information requests
-SEARCH - For web searches and information lookup
-MATH - For mathematical calculations
-TIME - For current time/date queries
-SYSTEM - For system information (CPU, memory, disk usage)
-FILE - For file and folder operations
-UTILITY - For jokes, random numbers, coin flips, etc.
-GENERAL - For general conversation and questions
+    # ── Interaction helpers ──────────────────────────────────────────────────
 
-User command: "{command}"
+    def confirm(self, question: str) -> bool:
+        """Ask the user to approve an action. Blocks the calling (worker) thread."""
+        stream = getattr(self, "stream", None)
+        # Only commands that came from live voice are confirmed out loud; a typed
+        # command keeps using the dialog even while the microphone is live.
+        if stream is not None and getattr(_ORIGIN, "voice", False):
+            try:
+                return bool(stream.ask_yes_no(question))
+            except Exception:
+                log.exception("live voice confirmation failed")
+                return False
+        callback = getattr(self, "confirm_callback", None)
+        if callback:
+            try:
+                return bool(callback(question))
+            except Exception:
+                log.exception("confirm callback failed")
+                return False
+        if getattr(self, "_voice_mode", False):
+            try:
+                self.voice_engine.speak(question + " Say yes or no.")
+                answer = self.voice_engine.listen_for_command(timeout=8) or ""
+            except Exception:
+                log.exception("voice confirmation failed")
+                return False
+            return bool(re.match(r"\s*(yes|yeah|yep|sure|do it|confirm|go ahead)\b", answer, re.I))
+        if getattr(self, "_console_mode", False) and sys.stdin and sys.stdin.isatty():
+            try:
+                return input(f"{question} [y/N]: ").strip().lower() in ("y", "yes")
+            except (EOFError, KeyboardInterrupt):
+                return False
+        return False
 
-Respond with ONLY the category name (e.g., "AUTOMATION", "WEATHER", etc.). No explanation needed.
-"""
-            
-            # Get classification from AI brain
-            if hasattr(self, 'multi_brain') and self.multi_brain:
-                classification = self.multi_brain.process_command(classification_prompt, use_context=False)
-            elif hasattr(self, 'openrouter_brain') and self.openrouter_brain and self.openrouter_brain.available:
-                classification = self.openrouter_brain.process_command(classification_prompt, use_context=False)
-            else:
-                classification = self.brain.process_command(classification_prompt, use_context=False)
-            
-            # Extract the category from the response
-            classification = classification.strip().upper()
-            
-            # Validate the classification
-            valid_categories = ['AUTOMATION', 'APP', 'WEATHER', 'SEARCH', 'MATH', 'TIME', 'SYSTEM', 'FILE', 'UTILITY', 'GENERAL']
-            
-            for category in valid_categories:
-                if category in classification:
-                    return category
-            
-            # Default fallback
-            return 'GENERAL'
-            
-        except Exception as e:
-            console.print(f"[yellow]Classification error: {e}[/yellow]")
-            # Fallback to automation for app-related commands
-            command_lower = command.lower()
-            if any(word in command_lower for word in ['open', 'launch', 'start']):
-                return 'AUTOMATION'
-            return 'GENERAL'
+    def notify(self, text: str, speak: bool = False, speak_text: str = None) -> None:
+        """Proactive message (alarms, reminders, background status)."""
+        dashboard = getattr(self, "web_dashboard", None)
+        if dashboard is not None:
+            try:
+                dashboard.on_notify(text)
+            except Exception:
+                log.exception("dashboard notify failed")
+        callback = getattr(self, "notify_callback", None)
+        if callback:
+            try:
+                callback(text)
+            except Exception:
+                log.exception("notify callback failed")
+        else:
+            console.print(f"[bold cyan]JARVIS:[/bold cyan] {text}")
+        if speak and (self.voice_output_enabled or self._voice_mode or callback is None):
+            try:
+                self.voice_engine.speak(speak_text or text, summarize=True)
+            except Exception:
+                log.exception("notify speech failed")
 
-    def _handle_classified_command(self, command, intent, use_voice=True):
-        """Handle commands based on AI-classified intent and return the response"""
-        
-        if intent == 'EXIT':
-            response = "Goodbye. JARVIS systems shutting down."
-            if use_voice:
-                self.voice_engine.speak(response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-            self.shutdown()
-            return response
-            
-        elif intent == 'GENERAL':
-            return self._handle_conversational_response(command, use_voice)
-            
-        elif intent == 'TIME':
-            return self._handle_time_commands(command, use_voice)
-            
-        elif intent == 'MATH':
-            return self._handle_math_commands(command, use_voice)
-            
-        elif intent == 'SYSTEM':
-            return self._handle_system_commands(command, use_voice)
-            
-        elif intent == 'WEATHER':
-            result = self.weather_skill.get_weather()
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return result
-            
-        elif intent == 'SEARCH':
-            return self._handle_search_commands(command, use_voice)
-            
-        elif intent == 'APP':
-            return self._handle_app_commands(command, use_voice)
-            
-        elif intent == 'UTILITY':
-            return self._handle_utility_commands(command, use_voice)
-            
-        elif intent == 'FILE':
-            return self._handle_file_commands(command, use_voice)
-            
-        elif intent == 'AUTOMATION':
-            return self._handle_automation_commands(command, use_voice)
-            
-        elif intent == 'SCREEN_AUTOMATION':
-            return self._handle_screen_automation_commands(command, use_voice)
-            
-        return None  # Not handled, use agent orchestrator
+    def _say(self, text, use_voice):
+        """Print (CLI) and optionally speak a reply."""
+        from rich.markup import escape
+        if text is None:
+            return
+        console.print(f"[blue]JARVIS:[/blue] {escape(str(text))}")
+        if use_voice:
+            try:
+                try:
+                    self.voice_engine.speak(str(text), summarize=True)
+                except TypeError:
+                    self.voice_engine.speak(str(text))
+            except Exception:
+                log.exception("speech failed")
+
+    def _ask_to_confirm(self, prompt: str, action, label: str = ""):
+        """Destructive action: queue it and ask for a yes (works in text and voice, several can wait)."""
+        with _PENDING_LOCK:
+            if getattr(self, "_pending_actions", None) is None:
+                self._pending_actions = []
+            self._pending_actions.append({"prompt": prompt, "run": action, "created": time.monotonic(),
+                                          "label": label})
+        return f"{prompt} Reply yes to confirm, or no to cancel."
+
+    @property
+    def _pending_action(self):
+        queue = getattr(self, "_pending_actions", None) or []
+        return queue[0] if queue else None
+
+    # ── Main entry ───────────────────────────────────────────────────────────
 
     def process_command(self, command, use_voice=True):
-        """Process and execute commands with intelligent intent classification"""
-        if not command:
-            return
-        
-        original_command = command
-        command = command.lower().strip()
+        """Process one user message and return the reply text."""
+        if not command or not str(command).strip():
+            return None
+        original_command = str(command).strip()
+        command = original_command.lower()
+        bare = command.rstrip(".!? ")
         self.last_activity = time.time()
-        
-        console.print(f"[green]Processing command:[/green] {command}")
-        
-        # Handle essential immediate commands first (no AI needed)
-        if any(word in command for word in ["goodbye", "exit", "quit", "shutdown jarvis"]):
+        console.print(f"[green]Processing command:[/green] {original_command}")
+
+        if bare in {"goodbye", "exit", "quit", "shutdown jarvis", "bye jarvis", "goodbye jarvis", "exit jarvis",
+                    "quit jarvis"}:
             response = "Goodbye. JARVIS systems shutting down."
-            if use_voice:
-                self.voice_engine.speak(response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-            self.shutdown()
-            return
-        
-        # Sleep command
-        if any(word in command for word in ["sleep", "standby", "go to sleep"]):
+            self._say(response, use_voice)
+            try:
+                self.shutdown()
+            except Exception:
+                log.exception("shutdown failed")
+            return response
+        if bare in {"sleep", "standby", "go to sleep", "jarvis sleep", "jarvis go to sleep"}:
             self.is_sleeping = True
-            response = "Entering sleep mode."
-            if use_voice:
-                self.voice_engine.speak(response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        # Wake up command
-        if any(phrase in command for phrase in ["wake up", "wake", "jarvis wake up"]):
+            response = "Entering sleep mode. Say 'wake up' when you need me."
+            self._say(response, use_voice)
+            return response
+        if bare in {"wake up", "wake", "jarvis wake up", "wake up jarvis", "hey jarvis wake up"}:
             self.is_sleeping = False
-            response = "I'm awake and ready to assist, sir."
-            if use_voice:
-                self.voice_engine.speak(response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        # Skip processing if sleeping
-        if self.is_sleeping:
-            return
-        
-        # Use AI to classify and route the command intelligently
-        intent = self._classify_command_intent(command)
-        console.print(f"[dim]Classified intent: {intent}[/dim]")
-        
-        # Handle the command based on its classified intent
-        response = self._handle_classified_command(original_command, intent, use_voice)
-        
-        if response:
-            # Command was handled and got a response
+            response = "I'm awake and ready to assist."
+            self._say(response, use_voice)
             return response
-        else:
-            # Fallback to agent orchestrator for complex queries
-            try:
-                if self.agent_available and hasattr(self, 'agent'):
-                    response = self.agent.run(original_command)
-                else:
-                    response = self._fallback_brain(original_command)
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                return response
-            except Exception as e:
-                console.print(f"[yellow]Agent processing failed: {e}[/yellow]")
-                # Try direct fallback brain processing
-                try:
-                    response = self._fallback_brain(original_command)
-                    if use_voice:
-                        self.voice_engine.speak(response)
-                    else:
-                        console.print(f"[blue]JARVIS:[/blue] {response}")
-                    return response
-                except Exception as fallback_error:
-                    error_msg = "I'm sorry, I encountered an error processing that request. Please try a more specific command."
-                    console.print(f"[red]Processing error: {fallback_error}[/red]")
-                    if use_voice:
-                        self.voice_engine.speak(error_msg)
-                    else:
-                        console.print(f"[blue]JARVIS:[/blue] {error_msg}")
+        if getattr(self, "is_sleeping", False):
+            return "JARVIS is sleeping. Say 'wake up' to resume."
 
-    def _handle_conversational_response(self, command, use_voice=True):
-        """Handle conversational greetings and responses using AI"""
+        brain = getattr(self, "brain", None)
+        history = getattr(brain, "conversation_history", None)
+        turns_before = len(history) if isinstance(history, list) else None
         try:
-            # For simple greetings, use quick responses
-            command_lower = command.lower().strip()
-            simple_greetings = ["hi", "hello", "hey"]
-            
-            if command_lower in simple_greetings:
-                # Get current time for context
-                current_hour = datetime.now().hour
-                if current_hour < 12:
-                    time_greeting = "Good morning"
-                elif current_hour < 17:
-                    time_greeting = "Good afternoon"
-                else:
-                    time_greeting = "Good evening"
-                
-                responses = [
-                    f"{time_greeting}, sir. How may I assist you today?",
-                    f"{time_greeting}. What can I do for you?",
-                    f"Hello, sir. Ready to help as always.",
-                    f"{time_greeting}. At your service."
-                ]
-                response = random.choice(responses)
-            else:
-                # For complex conversational questions, use AI
-                conversation_prompt = f"""You are JARVIS, Tony Stark's AI assistant. Respond to this conversational query in a helpful, intelligent manner. Keep responses concise and in character as JARVIS.
-
-User: {command}
-
-JARVIS:"""
-                
-                # Get response from AI brain
-                if hasattr(self, 'multi_brain') and self.multi_brain:
-                    response = self.multi_brain.process_command(conversation_prompt, use_context=False)
-                elif hasattr(self, 'openrouter_brain') and self.openrouter_brain and self.openrouter_brain.available:
-                    response = self.openrouter_brain.process_command(conversation_prompt, use_context=False)
-                else:
-                    response = self.brain.process_command(conversation_prompt, use_context=False)
-                
-                # Clean up the response
-                response = response.strip()
-                if response.startswith("JARVIS:"):
-                    response = response[7:].strip()
-            
-            if use_voice:
-                self.voice_engine.speak(response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-            return response
-            
-        except Exception as e:
-            console.print(f"[yellow]Conversation error: {e}[/yellow]")
-            # Fallback response
-            response = "I'm here to assist you, sir. How may I help?"
-            if use_voice:
-                self.voice_engine.speak(response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-            return response
-
-    def _handle_time_commands(self, command, use_voice=True):
-        """Handle time and date related commands"""
-        command_lower = command.lower()
-        
-        if any(phrase in command_lower for phrase in ["what time", "current time", "time now", "whats the time", "time is"]):
-            try:
-                import pytz
-                from datetime import datetime
-                
-                # Get local timezone
-                local_tz = None
-                try:
-                    import time as time_module
-                    local_tz = pytz.timezone(time_module.tzname[0])
-                except:
-                    # Fallback to system timezone
-                    local_tz = pytz.timezone('Asia/Kolkata')  # IST as you mentioned
-                
-                # Get current time in local timezone
-                now = datetime.now(local_tz)
-                current_time = now.strftime("%I:%M %p")
-                timezone_name = now.strftime("%Z")
-                
-                response = f"It's {current_time} {timezone_name}, sir."
-            except ImportError:
-                # Fallback if pytz not available
-                current_time = datetime.now().strftime("%I:%M %p")
-                response = f"It's {current_time}, sir."
-                
-        elif any(phrase in command_lower for phrase in ["what date", "today's date", "whats the date", "date today", "what day"]):
-            try:
-                import pytz
-                from datetime import datetime
-                
-                # Get local timezone
-                local_tz = None
-                try:
-                    import time as time_module
-                    local_tz = pytz.timezone(time_module.tzname[0])
-                except:
-                    local_tz = pytz.timezone('Asia/Kolkata')  # IST fallback
-                
-                now = datetime.now(local_tz)
-                current_date = now.strftime("%A, %B %d, %Y")
-                response = f"Today is {current_date}, sir."
-            except ImportError:
-                current_date = datetime.now().strftime("%A, %B %d, %Y")
-                response = f"Today is {current_date}, sir."
-        else:
-            response = "I can tell you the current time or date. What would you like to know?"
-        
-        if use_voice:
-            self.voice_engine.speak(response)
-        else:
-            console.print(f"[blue]JARVIS:[/blue] {response}")
+            response = self._route(original_command)
+        except Exception as exc:
+            log.exception("command failed: %s", original_command)
+            response = f"Something went wrong handling that ({exc})."
+        if turns_before is not None and response is not None and len(history) == turns_before:
+            try:                       # every turn is context — plans, confirmations and quick commands too
+                brain.record_exchange(original_command, response)
+            except Exception:
+                log.exception("recording the exchange failed")
+        if response is None:
+            response = "I'm not sure how to respond to that."
+        elif not isinstance(response, str):
+            response = str(response)
+        self._say(response, use_voice)
         return response
 
-    def _handle_math_commands(self, command, use_voice=True):
-        """Handle mathematical calculations intelligently"""
-        import re
-        
-        # Clean up the command for better math detection
-        math_query = command.lower()
-        
-        # Remove common question words and phrases more carefully
-        question_patterns = [
-            r'\b(what\s+is|whats|what\'s|calculate|math|compute|solve|tell\s+me|can\s+you\s+tell\s+me|what\s+is\s+the\s+answer\s+for)\b',
-            r'\b(the\s+answer\s+for|answer\s+for|result\s+of)\b'
-        ]
-        
-        for pattern in question_patterns:
-            math_query = re.sub(pattern, '', math_query).strip()
-        
-        # Replace word operators with symbols
-        math_query = re.sub(r'\bplus\b', '+', math_query)
-        math_query = re.sub(r'\bminus\b', '-', math_query)
-        math_query = re.sub(r'\btimes\b', '*', math_query)
-        math_query = re.sub(r'\bmultiplied\s+by\b', '*', math_query)
-        math_query = re.sub(r'\bdivided\s+by\b', '/', math_query)
-        math_query = re.sub(r'\bx\b', '*', math_query)  # Handle "10x10" as "10*10"
-        math_query = re.sub(r'×', '*', math_query)
-        math_query = re.sub(r'÷', '/', math_query)
-        
-        # Clean up extra spaces and punctuation
-        math_query = re.sub(r'\s+', '', math_query)
-        math_query = re.sub(r'[^\d+\-*/\.]', '', math_query)  # Keep only numbers and operators
-        
-        # Look for mathematical patterns - more flexible
-        math_pattern = r'^[-+]?\d*\.?\d+[+\-*/][-+]?\d*\.?\d+$'
-        
-        if re.match(math_pattern, math_query):
-            try:
-                # Use eval for simple math expressions (safe since we've cleaned the input)
-                result = eval(math_query)
-                response = f"{command.strip()} = {result}"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                return response
-            except Exception as e:
-                console.print(f"[yellow]Math calculation error: {e}[/yellow]")
-                # Fallback to utility skill
-                try:
-                    result = self.utility_skill.calculate(math_query)
-                    if use_voice:
-                        self.voice_engine.speak(result)
-                    else:
-                        console.print(f"[blue]JARVIS:[/blue] {result}")
-                    return result
-                except:
-                    return None
-        else:
-            # If no clear math expression found, try utility skill directly
-            try:
-                result = self.utility_skill.calculate(command)
-                if result and "Error" not in result:
-                    if use_voice:
-                        self.voice_engine.speak(result)
-                    else:
-                        console.print(f"[blue]JARVIS:[/blue] {result}")
-                    return result
-            except:
-                pass
-            
-            # If still no result, let it go to general AI
-            return None
-            return False
+    def _route(self, original_command):
+        # The fast routes get casual speech tidied ("hi um can you like start chrome" → "start chrome");
+        # the language model and the history always get exactly what was said.
+        from core.natural import tidy
+        # Several routing patterns backtrack on long space runs (3,000 spaces took 90 s in a search); no
+        # real request needs more than a few in a row, so cap them before any routing regex sees the text.
+        original_command = re.sub(r"(\s{8})\s+", r"\1", original_command)
+        said, original_command = original_command, self._resolve_reference(tidy(original_command))
+        command = original_command.lower().strip()
+        bare = command.rstrip(".!? ")
 
-    def _handle_system_commands(self, command, use_voice=True):
-        """Handle system-related commands"""
-        command_lower = command.lower()
-        
-        if any(phrase in command_lower for phrase in ["cpu usage", "processor usage", "whats the cpu", "cpu"]):
-            try:
-                if hasattr(self, 'system_monitor') and self.system_monitor:
-                    # Use advanced system monitor if available
-                    cpu_info = self.system_monitor.get_cpu_info()
-                    response = f"CPU Usage: {cpu_info.get('usage', 'Unknown')}%, sir."
-                else:
-                    # Fallback to basic system control
-                    status = self.system_control.get_cpu_usage()
-                    if "CPU Usage:" in status:
-                        percentage = status.split(": ", 1)[1]
-                        response = f"Your CPU is currently at {percentage}, sir."
-                    else:
-                        response = status
-                        
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                return response
-            except Exception as e:
-                response = f"Unable to get CPU usage: {e}"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                return response
-            
-        elif any(phrase in command_lower for phrase in ["ram usage", "memory usage", "whats the ram", "memory"]):
-            try:
-                if hasattr(self, 'system_monitor') and self.system_monitor:
-                    # Use advanced system monitor if available
-                    memory_info = self.system_monitor.get_memory_info()
-                    used_gb = memory_info.get('used_gb', 0)
-                    total_gb = memory_info.get('total_gb', 0)
-                    percentage = memory_info.get('percentage', 0)
-                    response = f"Memory usage: {used_gb:.1f} GB of {total_gb:.1f} GB ({percentage}%), sir."
-                else:
-                    # Fallback to basic system control
-                    status = self.system_control.get_memory_usage()
-                    if "Memory:" in status:
-                        parts = status.split(": ", 1)[1]
-                        response = f"Your system is using {parts}, sir."
-                    else:
-                        response = status
-                        
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                return response
-            except Exception as e:
-                response = f"Unable to get memory usage: {e}"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                return response
-            
-        elif any(phrase in command_lower for phrase in ["system status", "system report", "system info", "system information"]):
-            try:
-                if hasattr(self, 'system_monitor') and self.system_monitor:
-                    # Use advanced system monitor for comprehensive info
-                    cpu_info = self.system_monitor.get_cpu_info()
-                    memory_info = self.system_monitor.get_memory_info()
-                    disk_info = self.system_monitor.get_disk_info()
-                    
-                    response = f"""System Status Report:
-• CPU: {cpu_info.get('usage', 'N/A')}% usage, {cpu_info.get('cores', 'N/A')} cores
-• Memory: {memory_info.get('used_gb', 0):.1f}/{memory_info.get('total_gb', 0):.1f} GB ({memory_info.get('percentage', 0)}%)
-• Disk: {disk_info.get('used_gb', 0):.1f}/{disk_info.get('total_gb', 0):.1f} GB used"""
-                else:
-                    # Fallback to basic system control
-                    status = self.system_control.get_system_status()
-                    response = f"System status: {status}"
-                
-                if use_voice:
-                    short_response = "Here's your system status, sir."
-                    self.voice_engine.speak(short_response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] System Status Report")
-                
-                console.print(Panel(response, title="System Status", border_style="green"))
-                return response
-            except Exception as e:
-                response = f"Unable to get system status: {e}"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                return response
-            
-        elif any(phrase in command_lower for phrase in ["running processes", "process list"]):
-            try:
-                processes = self.system_control.get_running_processes()
-                response = "Top running processes displayed above, sir."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                console.print(Panel(processes, title="Running Processes", border_style="yellow"))
-                return response
-            except Exception as e:
-                response = f"Unable to get process list: {e}"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                return response
-            
-        elif any(phrase in command_lower for phrase in ["disk usage", "storage"]):
-            disk_info = self.system_control.get_disk_usage()
-            response = "Here's your disk usage information, sir."
-            if use_voice:
-                self.voice_engine.speak(response)
-            console.print(Panel(disk_info, title="Disk Usage", border_style="blue"))
-            return True
-            
-        return False
-
-    def _handle_search_commands(self, command, use_voice=True):
-        """Handle search-related commands"""
-        command_lower = command.lower()
-        
-        # Extract search query
-        query = command_lower
-        for prefix in ["search for ", "look up ", "google ", "find ", "search "]:
-            if query.startswith(prefix):
-                query = query[len(prefix):].strip()
-                break
-        
-        if "wikipedia" in command_lower or "wiki" in command_lower:
-            query = query.replace("wikipedia", "").replace("wiki", "").strip()
-            result = self.web_skill.search_wikipedia(query)
-        elif "news" in command_lower or "headlines" in command_lower:
-            result = self.web_skill.get_news_headlines()
-        else:
-            # Use comprehensive search with LLM summarization
-            result = self.web_skill.search_web(query, open_browser=False, llm_brain=self.brain)
-        
-        if use_voice:
-            # For voice output, provide a shorter summary
-            if len(result) > 500:
-                summary_lines = result.split('\n')[:5]  # First few lines
-                voice_result = '\n'.join(summary_lines) + "\n\nDetailed results available in the interface."
-                self.voice_engine.speak(voice_result)
+        # 1. A pending destructive action waits for yes/no.
+        is_yes = _YES.fullmatch(bare)
+        is_no = _NO.fullmatch(bare)
+        pending = None
+        with _PENDING_LOCK:
+            queue = getattr(self, "_pending_actions", None)
+            if queue is None:
+                queue = self._pending_actions = []
+            now = time.monotonic()
+            expired = [p for p in queue if now - p.get("created", now) > _CONFIRM_TTL]
+            queue[:] = [p for p in queue if now - p.get("created", now) <= _CONFIRM_TTL]
+            if queue and (is_yes or is_no):
+                pending = queue.pop(0)          # claimed under the lock: exactly one answer per prompt
+            elif queue:
+                queue.clear()   # an unrelated request cancels anything still waiting
+        if pending is not None:
+            if is_yes:
+                try:            # run outside the lock: the action may itself queue another confirmation
+                    reply = str(pending["run"]())
+                except Exception as exc:
+                    log.exception("confirmed action failed")
+                    reply = f"That failed: {exc}"
             else:
-                self.voice_engine.speak(result)
+                reply = "Cancelled. Nothing was changed."
+            with _PENDING_LOCK:
+                if queue:
+                    queue[0]["created"] = time.monotonic()   # its countdown starts when it is asked
+                    reply += f" Next: {queue[0]['prompt']} Reply yes or no."
+            return reply
+
+        # 1a. "write an essay about X and type it there / in notepad": the AI writes, JARVIS types it in.
+        compose = self._compose_request(original_command)
+        if compose is not None:
+            return compose
+
+        # 1b. Follow-ups that lean on the conversation ("play it again", "make it shorter", "rename it
+        # to notes.txt") go to the language model with the history, the desktop state and tools; every
+        # fast route below only ever sees this one message. The common ones ("close it", "what about
+        # mumbai") were already resolved into a plain command above, so they skip this.
+        if original_command == tidy(said) and self._is_follow_up(said):
+            return self._fallback_brain(said)
+
+        # 2. File deletions need a yes; everything else in the file syntax is deterministic.
+        processor = getattr(self, "command_processor", None)
+        plan = processor.plan(original_command) if processor is not None else None
+        file_skill = getattr(self, "file_skill", None)
+        m = re.match(r"^(?:please\s+)?(?:delete|remove)\s+(?:the\s+)?file\s+(.+?)[.!?]*$", original_command, re.I)
+        if file_skill and m and not (plan and len(plan.steps) > 1):
+            target = m.group(1).strip().strip('"\'')
+            return self._ask_to_confirm(f"Delete the file '{target}'?",
+                                        lambda: file_skill.delete_file(target), "delete_file")
+        if not m:
+            response = file_skill.route_command(original_command) if file_skill else None
+            if response is not None:
+                return response
+
+        # A bare yes/no with nothing waiting must not reach the model as a fresh request
+        # ("stop" / "cancel" keep their own meaning below).
+        answer = is_yes or re.fullmatch(r"(no|nope|n)(,?\s*(thanks|thank you))?", bare)
+        if answer and expired:
+            return "That confirmation expired, so nothing was changed. Please ask again."
+        brain = getattr(self, "brain", None)
+        if answer and not (brain is not None and getattr(brain, "current_model", None)):
+            return "There's nothing waiting for your confirmation right now."
+
+        # 3. Built-in meta commands.
+        meta = self._meta_command(original_command, bare)
+        if meta is not None:
+            return meta
+
+        # 4. Compound requests ("…and then…", "…simultaneously…") run as ordered / parallel steps.
+        if plan is not None and len(plan.steps) > _MAX_PLAN_STEPS:
+            # A pasted page can split into thousands of actions (and one thread per parallel lane).
+            return (f"That splits into {len(plan.steps)} separate actions — more than the {_MAX_PLAN_STEPS} I'll "
+                    "run in one go. Please break it into smaller requests.")
+        if plan is not None and len(plan.steps) > 1:
+            return self._run_plan(plan)
+
+        # 4a. The regex splitter found nothing to split, but the decision engine still
+        # flags this as multi-step (e.g. no explicit connector, or a construction the
+        # splitter doesn't know) — ask the model to break it into steps as a fallback,
+        # then run those through the same plan/execute machinery as a normal plan.
+        if plan is not None and len(plan.steps) <= 1:
+            llm_plan = self._llm_plan_fallback(said)
+            if llm_plan is not None:
+                return self._run_plan(llm_plan)
+
+        # 4b. Buddy mode: "where's the export button?" gets pointed at on screen.
+        buddy = getattr(self, "buddy", None)
+        if buddy is not None:
+            from core.buddy import is_guide_question
+            if is_guide_question(original_command):
+                return buddy.ask(said, speak=False).answer
+
+        # 4c. Just an app's name ("notepad"): open it.
+        from skills.app_control import _APP_ALIASES
+        if bare in _APP_ALIASES and getattr(self, "app_control", None) is not None:
+            response = self.app_control.launch_app_by_name(bare)
+            self._remember_app(response)
+            return response
+
+        # 5. Decide (local model / rules; never an LLM call).
+        intent = self._classify_command_intent(original_command)
+        self._last_intent = intent
+        decision = getattr(self, "_last_decision", None)
+        try:
+            console.print(f"[dim]Intent: {intent}"
+                          + (f" ({decision.source}, {decision.confidence:.2f})" if decision else "") + "[/dim]")
+        except Exception:
+            pass
+
+        response = self._handle_classified_command(original_command, intent, use_voice=False)
+        if response is None:
+            response = self._fallback_brain(said)
         else:
-            console.print(f"[blue]JARVIS:[/blue] {result}")
+            self._remember_app(response)
+            if getattr(self, "brain", None) is not None and not getattr(response, "is_error", False):
+                try:
+                    self.brain.record_exchange(said, response)
+                except Exception:
+                    pass
+        return response
+
+    # ── Conversation context ─────────────────────────────────────────────────
+
+    def _is_follow_up(self, command):
+        """Does this message lean on earlier turns? Only when a recent conversation exists and the
+        current model can act through tools (otherwise the fast routes are still the better bet)."""
+        brain = getattr(self, "brain", None)
+        model = getattr(brain, "current_model", None) if brain is not None else None
+        if not model:
+            return False
+        models = getattr(brain, "available_models", None)
+        if not isinstance(models, dict) or not models.get(model, {}).get("supports_tools"):
+            return False
+        history = getattr(brain, "conversation_history", None)
+        if not isinstance(history, list) or not history:
+            return False
+        try:
+            last = datetime.fromisoformat(str(history[-1].get("ts")))
+            if (datetime.now(last.tzinfo) - last).total_seconds() > _FOLLOW_UP_WINDOW:
+                return False
+        except (TypeError, ValueError, AttributeError):
+            pass                                   # no timestamp: treat the history as recent
+        text = _IDIOMS.sub(" ", command)
+        if not _FOLLOW_UP.search(text):
+            return False
+        from core.decision import rule_decision
+        from core.natural import tidy
+        plain = rule_decision(tidy(command))
+        if plain.source == "rules" and plain.intent == "media":
+            return False                           # "pause it", "turn it up": "it" is whatever's playing
+        if getattr(self, "buddy", None) is not None:
+            from core.buddy import is_guide_question
+            if is_guide_question(command):         # "where's the export button?" → buddy points
+                return False
         return True
 
-    def _handle_app_commands(self, command, use_voice=True):
-        """Handle application launching commands"""
-        import re
-        command_lower = command.lower()
-        
-        # Look for app launch patterns in the command
-        # Pattern 1: "open/launch/start/run + app_name"
-        app_patterns = [
-            r'\b(?:open|launch|start|run)\s+(\w+)',
-            r'\bopen\s+(\w+)',
-            r'\blaunch\s+(\w+)',
-            r'\bstart\s+(\w+)',
-            r'\brun\s+(\w+)'
-        ]
-        
-        app_name = None
-        for pattern in app_patterns:
-            match = re.search(pattern, command_lower)
-            if match:
-                app_name = match.group(1)
-                break
-        
-        # If no pattern matched, try simple extraction
-        if not app_name:
-            for prefix in ["open ", "launch ", "start ", "run "]:
-                if prefix in command_lower:
-                    parts = command_lower.split(prefix)
-                    if len(parts) > 1:
-                        # Take the first word after the prefix
-                        app_name = parts[1].split()[0] if parts[1].split() else None
-                        break
-        
-        if app_name:
-            result = self.system_control.launch_application(app_name)
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return result
-        else:
-            # No clear app name found, let AI handle it
+    def _resolve_reference(self, command):
+        """Rewrite the everyday follow-ups into plain commands the fast routes handle reliably
+        (a small local model often just *says* "Closed Notepad." without doing it)."""
+        m = _APP_REFERENCE.match(command)
+        if m:
+            app = getattr(self, "_last_app", None)
+            if not app:
+                front = self._foreground_title()
+                app = front if front and "jarvis" not in front.lower() else None
+            if app:
+                verb = m.group("verb").lower()
+                if verb in ("focus", "switch back to", "go back to", "bring back", "back to"):
+                    verb = "switch to"
+                return f"{verb} {app}"
+        m = _WHAT_ABOUT.match(command)
+        if m and getattr(self, "_last_intent", None) == "WEATHER":
+            return f"weather in {m.group('x').strip()}"
+        return command
+
+    def _desktop_context(self):
+        """One line for the model's system prompt: what "there" and "it" most likely mean."""
+        parts = []
+        front = self._foreground_title()
+        if front and "jarvis" not in front.lower():
+            parts.append(f"the window in front is '{front}'")
+        last = getattr(self, "_last_app", None)
+        if last:
+            parts.append(f"the app JARVIS opened most recently is {last}")
+        return ("; ".join(parts) + ".") if parts else ""
+
+    # ── Writing into apps ("…and type it there") ─────────────────────────────
+
+    def _remember_app(self, reply):
+        """'Opened Notepad.' → Notepad is where "type it there" goes next."""
+        from core.compose import opened_app
+        name = opened_app(str(reply)) if reply else None
+        if name:
+            self._last_app = name
+        last = getattr(self, "_last_app", None)
+        if last and re.match(r"^(?:Closed|Asked to close)\b", str(reply or "")) and last.lower() in str(reply).lower():
+            self._last_app = None                  # "close it" twice shouldn't aim at an app that's gone
+
+    def _compose_request(self, command):
+        """Handle "write X and type it there / in <app>"; None when the request isn't one."""
+        from core.compose import parse
+        from skills.app_control import _APP_ALIASES
+        last = getattr(self, "_last_app", None)
+        request = parse(command, known_apps=list(_APP_ALIASES) + ([last] if last else []))
+        if request is None:
             return None
+        return self._compose_and_type(request, command)
 
-    def _handle_utility_commands(self, command, use_voice=True):
-        """Handle utility/fun commands"""
-        command_lower = command.lower()
-        
-        if any(phrase in command_lower for phrase in ["tell me a joke", "joke"]):
-            joke = self.utility_skill.tell_joke()
-            if use_voice:
-                self.voice_engine.speak(joke)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {joke}")
-            return True
-            
-        elif any(phrase in command_lower for phrase in ["flip a coin", "coin flip"]):
-            result = self.utility_skill.flip_coin()
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return True
-            
-        elif any(phrase in command_lower for phrase in ["roll dice", "roll a die"]):
-            result = self.utility_skill.roll_dice()
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return True
-            
-        return False
-
-    def _handle_file_commands(self, command, use_voice=True):
-        """Handle file operations using agent orchestrator"""
-        # File operations are complex, let agent orchestrator handle them
-        return False
-
-    def _handle_automation_commands(self, command, use_voice=True):
-        """Handle automation and scheduling commands"""
-        
-        # Check if this is a multi-step command (contains "then", "and", commas, etc.)
-        command_lower = command.lower()
-        is_multi_step = (
-            any(word in command_lower for word in ['then', 'after', 'next', 'and then', 'followed by', 'subsequently']) or
-            len(command.split(',')) > 1 or
-            (len(command.split(' and ')) > 1 and any(action in command_lower for action in ['open', 'type', 'save', 'close', 'click']))
-        )
-        
-        # Handle multi-step tasks using visual task orchestrator
-        if is_multi_step or self._is_complex_task(command):
-            try:
-                from skills.visual_task_orchestrator import process_visual_task
-                result = process_visual_task(command)
-                
-                if use_voice:
-                    # Provide appropriate voice feedback
-                    if "✅" in result:
-                        self.voice_engine.speak("Task completed successfully")
-                    else:
-                        self.voice_engine.speak("Task encountered an issue")
-                
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-                return result
-                
-            except Exception as e:
-                error_msg = f"Complex task error: {str(e)}"
-                console.print(f"[red]Error:[/red] {error_msg}")
-                if use_voice:
-                    self.voice_engine.speak("Complex task encountered an error")
-                return error_msg
-        
-        # Handle screen automation commands (including click commands)
-        if any(keyword in command.lower() for keyword in ['automate', 'auto', 'screen', 'ai help with']) or any(phrase in command.lower() for phrase in ['click on', 'find and click', 'locate and click', 'press on', 'tap on']):
-            try:
-                if hasattr(self, 'screen_automation') and self.screen_automation:
-                    # Check if this is a specific click command
-                    if any(phrase in command.lower() for phrase in ['click on', 'find and click', 'locate and click', 'press on', 'tap on']):
-                        from skills.screen_automation import ScreenAutomationSkill
-                        automation = ScreenAutomationSkill()
-                        
-                        # Extract element name from click command
-                        import re
-                        click_patterns = [
-                            r"(?:click|find\s+and\s+click|locate\s+and\s+click|press|tap)\s+(?:on\s+)?(?:the\s+)?(.*)",
-                        ]
-                        
-                        element_name = None
-                        for pattern in click_patterns:
-                            match = re.search(pattern, command.lower())
-                            if match:
-                                element_name = match.group(1).strip()
-                                break
-                        
-                        if element_name:
-                            result = automation.find_and_click_element(element_name)
-                            if result.get('success', False):
-                                coords = result.get('coordinates', [])
-                                confidence = result.get('confidence', 0)
-                                response = f"✅ Successfully clicked '{element_name}' at coordinates {coords} (confidence: {confidence:.2f})"
-                            else:
-                                response = f"❌ Could not find '{element_name}' on screen. {result.get('message', '')}"
-                            
-                            if use_voice:
-                                # Provide shorter voice feedback
-                                if result.get('success', False):
-                                    self.voice_engine.speak(f"Clicked {element_name}")
-                                else:
-                                    self.voice_engine.speak(f"Could not find {element_name}")
-                            console.print(f"[blue]JARVIS:[/blue] {response}")
-                            return response
-                        else:
-                            response = "❌ Could not identify what to click. Please specify the element name."
-                            if use_voice:
-                                self.voice_engine.speak("Could not identify what to click")
-                            console.print(f"[blue]JARVIS:[/blue] {response}")
-                            return response
-                    else:
-                        # Use general automation system
-                        from skills.screen_automation import process_automation_command
-                        result = process_automation_command(command, self)
-                        if use_voice:
-                            self.voice_engine.speak(result[:200])  # Limit speech length
-                        console.print(f"[blue]JARVIS:[/blue] {result}")
-                        return result
-                else:
-                    error_msg = "Screen automation is not available."
-                    if use_voice:
-                        self.voice_engine.speak(error_msg)
-                    console.print(f"[yellow]JARVIS:[/yellow] {error_msg}")
-                    return error_msg
-            except Exception as e:
-                error_msg = f"Screen automation error: {str(e)}"
-                console.print(f"[red]Error:[/red] {error_msg}")
-                if use_voice:
-                    self.voice_engine.speak("Screen automation encountered an error")
-                return error_msg
-        
-        # Legacy automation handling - let agent orchestrator handle complex automation
-        # But first try simple app launching using AI app selector
-        if any(word in command_lower for word in ['open', 'launch', 'start', 'run']):
-            try:
-                if hasattr(self, 'ai_app_selector') and self.ai_app_selector:
-                    console.print(f"[cyan]🧠 Using AI to select best app for: {command}[/cyan]")
-                    
-                    # Use AI to find the best app
-                    selected_app = self.ai_app_selector.find_best_app_for_task(command)
-                    
-                    if selected_app:
-                        # Try to launch the app
-                        success = self.ai_app_selector.launch_app(selected_app)
-                        
-                        if success:
-                            result = f"Successfully launched {selected_app['name']}"
-                            if use_voice:
-                                self.voice_engine.speak(f"{selected_app['name']} has been launched")
-                            console.print(f"[blue]JARVIS:[/blue] {result}")
-                            return result
-                        else:
-                            result = f"Failed to launch {selected_app['name']}"
-                            if use_voice:
-                                self.voice_engine.speak(f"Could not launch {selected_app['name']}")
-                            console.print(f"[blue]JARVIS:[/blue] {result}")
-                            return result
-                    else:
-                        result = "Could not find a suitable application for this task"
-                        if use_voice:
-                            self.voice_engine.speak(result)
-                        console.print(f"[blue]JARVIS:[/blue] {result}")
-                        return result
-                        
-                elif hasattr(self, 'app_control') and self.app_control:
-                    # Fallback to old app control
-                    app_name = command_lower
-                    for word in ['open', 'launch', 'start', 'run']:
-                        app_name = app_name.replace(word, '').strip()
-                    
-                    # Clean up common words
-                    app_name = app_name.replace('the', '').replace('application', '').replace('app', '').replace('program', '').strip()
-                    
-                    console.print(f"[cyan]Attempting to launch: {app_name}[/cyan]")
-                    
-                    # Try to launch the app
-                    result = self.app_control.launch_app_by_name(app_name)
-                    
-                    if use_voice:
-                        if "successfully" in result.lower():
-                            self.voice_engine.speak(f"{app_name} has been launched")
-                        else:
-                            self.voice_engine.speak(f"Could not launch {app_name}")
-                    
-                    console.print(f"[blue]JARVIS:[/blue] {result}")
-                    return result
-                else:
-                    error_msg = "Application control is not available."
-                    if use_voice:
-                        self.voice_engine.speak(error_msg)
-                    console.print(f"[yellow]JARVIS:[/yellow] {error_msg}")
-                    return error_msg
-            except Exception as e:
-                error_msg = f"Application launch error: {str(e)}"
-                console.print(f"[red]Error:[/red] {error_msg}")
-                if use_voice:
-                    self.voice_engine.speak("Application launch encountered an error")
-                return error_msg
-        
-        return None
-    
-    def _handle_screen_automation_commands(self, command, use_voice=True):
-        """Handle screen automation commands using AI analysis - NO KEYWORDS"""
+    def _foreground_title(self):
         try:
-            if hasattr(self, 'screen_automation') and self.screen_automation:
-                # Use AI to determine the specific screen automation action
-                analysis_prompt = f"""
-                You are analyzing a screen automation command to determine what specific action to take.
-                
-                Command: "{command}"
-                
-                Determine the action type and respond with exactly one of these categories:
-                
-                TAKE_SCREENSHOT: If user wants to capture, take, or screenshot the screen
-                CLICK_ELEMENT: If user wants to click, press, tap, or interact with a specific UI element
-                TYPE_TEXT: If user wants to type, enter, or input text somewhere
-                FIND_ELEMENT: If user wants to locate, find, or identify something on screen
-                SCROLL_ACTION: If user wants to scroll up, down, or navigate
-                AUTOMATION_TASK: If this is a complex multi-step automation task
-                GENERAL_AUTOMATION: For any other screen/UI automation request
-                
-                Respond with just the category name and a brief description.
-                Format: CATEGORY: description
-                """
-                
-                # Get AI decision
-                ai_response = self._get_ai_response(analysis_prompt)
-                action_type = ai_response.split(':')[0].strip() if ':' in ai_response else ai_response.strip()
-                
-                console.print(f"[yellow]AI Decision:[/yellow] {ai_response}")
-                
-                # Execute based on AI decision
-                if action_type == "TAKE_SCREENSHOT":
-                    result = self._handle_screenshot_command(command)
-                    response = result
-                elif action_type == "CLICK_ELEMENT":
-                    result = self._handle_click_command(command)
-                    response = result
-                elif action_type == "AUTOMATION_TASK":
-                    # Route to complex automation handler
-                    return self._handle_automation_commands(command, use_voice)
-                else:
-                    # Use general screen automation processing
-                    from skills.screen_automation import process_automation_command
-                    result = process_automation_command(command, self)
-                    response = result
-                
-                if use_voice:
-                    self.voice_engine.speak(response[:200])  # Limit speech length
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-                return True
-            else:
-                error_msg = "Screen automation is not available."
-                if use_voice:
-                    self.voice_engine.speak(error_msg)
-                console.print(f"[yellow]JARVIS:[/yellow] {error_msg}")
-                return True
-                
-        except Exception as e:
-            error_msg = f"Screen automation error: {str(e)}"
-            console.print(f"[red]Error:[/red] {error_msg}")
-            if use_voice:
-                self.voice_engine.speak("Screen automation encountered an error")
-            return True
+            import win32gui
+            return win32gui.GetWindowText(win32gui.GetForegroundWindow()) or ""
+        except Exception:
+            return ""
 
-    def _handle_screenshot_command(self, command):
-        """Handle screenshot commands using AI"""
+    def _compose_and_type(self, request, command):
+        from core.compose import COMPOSE_SYSTEM_PROMPT
+        brain = getattr(self, "brain", None)
+        if brain is None or not getattr(brain, "current_model", None):
+            return ("I need an AI model to write that. Pick one in Settings (an Ollama model works offline), "
+                    "then ask again.")
+        windows = self.windows
+        target = request.app or (getattr(self, "_last_app", None) if request.here else None)
+        if target:
+            # Find (or open) the app before spending time writing, so a wrong name fails fast.
+            if not windows._find(target):
+                opened = self.app_control.launch_app_by_name(target)
+                if not str(opened).startswith("Opened"):
+                    return f"I couldn't open {target}: {opened}"
+                self._remember_app(opened)
+                deadline = time.time() + 8
+                while not windows._find(target) and time.time() < deadline:
+                    time.sleep(0.3)
+        else:
+            title = self._foreground_title()
+            if not title or "jarvis" in title.lower():
+                return ("Which app should I type it into? Open it first (say \"open notepad\"), "
+                        "or say \"… in notepad\".")
+            target = title
         try:
-            from skills.screen_automation import ScreenAutomationSkill
-            automation = ScreenAutomationSkill()
-            result = automation.take_screenshot()
-            # take_screenshot returns a filepath string, not a dict
-            return f"✅ Screenshot saved to: {result}"
-        except Exception as e:
-            return f"❌ Screenshot error: {str(e)}"
-    
-    def _handle_click_command(self, command):
-        """Handle click commands using AI to extract element name"""
+            text = brain.ask_text(request.prompt, system_prompt=COMPOSE_SYSTEM_PROMPT, max_tokens=2000,
+                                  temperature=0.7)
+        except Exception as exc:
+            log.exception("compose failed")
+            return f"I couldn't write that: {exc}"
+        text = re.sub(r"^\s*#{1,6}\s*|\*\*|__", "", str(text or ""), flags=re.M).strip()
+        if not text:
+            return "The AI didn't write anything — try asking again."
         try:
-            # Use AI to extract what element to click
-            extract_prompt = f"""
-            Extract the specific UI element name that the user wants to click from this command:
-            
-            Command: "{command}"
-            
-            Examples:
-            - "click on the save button" → save button
-            - "find and click settings" → settings  
-            - "press the close button" → close button
-            - "tap on menu" → menu
-            
-            Respond with just the element name, nothing else.
-            """
-            
-            element_name = self._get_ai_response(extract_prompt).strip()
-            
-            from skills.screen_automation import ScreenAutomationSkill
-            automation = ScreenAutomationSkill()
-            result = automation.find_and_click_element(element_name)
-            
-            if result.get('success', False):
-                coords = result.get('coordinates', [])
-                confidence = result.get('confidence', 0)
-                return f"✅ Successfully clicked '{element_name}' at coordinates {coords} (confidence: {confidence:.2f})"
-            else:
-                return f"❌ Could not find '{element_name}' on screen. {result.get('message', '')}"
-                
-        except Exception as e:
-            return f"❌ Click command error: {str(e)}"
-    
-    def _is_complex_task(self, command: str) -> bool:
-        """Use AI to determine if command is a complex multi-step task - NO KEYWORDS"""
+            brain.record_exchange(command, text)        # "make it shorter" next has the essay to work with
+        except Exception:
+            pass
+        focused = windows.window_action(target, "focus")
+        if not focused.startswith("Switched"):
+            windows.set_clipboard(text)
+            return f"I wrote it, but couldn't switch to {target} ({focused}). It's on your clipboard — press Ctrl+V."
+        time.sleep(0.5)
+        lock = getattr(self, "_input_lock", None)
+        if lock is not None:
+            with lock:
+                typed = windows.type_text(text)
+        else:
+            typed = windows.type_text(text)
+        if not typed.startswith("Typed"):
+            return f"I wrote it but couldn't type it: {typed}"
+        name = request.app or getattr(self, "_last_app", None) or target
+        return f"Done — wrote {len(text.split())} words and typed them into {name}."
+
+    def _llm_plan_fallback(self, command):
+        """When the regex splitter (skills/command_processor.py) finds nothing to
+        split but the request still looks compound, ask the model to break it into
+        steps. Returns None — meaning "nothing more to do than the regular
+        single-command path" — when there's no model available, the decision engine
+        doesn't think this is multi-step, or planning didn't produce more than one
+        real step."""
+        brain = getattr(self, "brain", None)
+        if brain is None or not getattr(brain, "current_model", None):
+            return None
+        decision = self.decision.decide(command)
+        self._last_decision = decision
+        if not decision.is_multi_step:
+            return None
         try:
-            analysis_prompt = f"""
-            Analyze this command to determine if it's a complex multi-step task that requires automation orchestration.
-            
-            Command: "{command}"
-            
-            A complex task typically involves:
-            - Multiple steps (open app, do action, save, etc.)
-            - File operations with multiple stages
-            - Application workflows (create document, type content, save)
-            - Setting up system features (alarms, reminders, timers)
-            - Email composition and sending
-            - Website navigation with actions
-            
-            Simple tasks are single actions like:
-            - Basic calculations
-            - Simple questions  
-            - Single screenshots
-            - Time/date queries
-            - Single clicks or searches
-            
-            Respond with exactly: YES or NO
-            """
-            
-            ai_response = self._get_ai_response(analysis_prompt).strip().upper()
-            return "YES" in ai_response
-            
-        except Exception as e:
-            console.print(f"[yellow]Warning:[/yellow] Error in complexity analysis: {e}")
-            # Default to simple for safety
-            return False
+            steps = brain.plan_steps(command)
+        except Exception:
+            log.exception("LLM plan fallback failed")
+            return None
+        if not isinstance(steps, (list, tuple)):
+            return None
+        steps = [s.strip() for s in steps if isinstance(s, str) and s.strip()]
+        if len(steps) <= 1 or len(steps) > _MAX_PLAN_STEPS:
+            return None
+        from skills.command_processor import Plan, Step
+        llm_plan = Plan(command)
+        for text in steps:
+            llm_plan.steps.append(Step(text, lane=0))
+        return llm_plan
 
-    def _get_ai_response(self, prompt):
-        """Get AI response using the configured model"""
-        try:
-            if self.use_multi_model and hasattr(self, 'multi_brain'):
-                return self.multi_brain.process_command(prompt)
-            elif getattr(self, 'use_advanced_brain', False) and hasattr(self, 'openrouter_brain'):
-                return self.openrouter_brain.process_command(prompt)
-            else:
-                # Fallback to basic brain
-                return self.brain.process_command(prompt)
-        except Exception as e:
-            console.print(f"[red]AI Response Error:[/red] {str(e)}")
-            return "I'm sorry, I couldn't process that request."
-            examples = """
-🎯 Example Commands:
+    def _classify_command_intent(self, command):
+        """Map the local decision engine's answer to a handler category."""
+        decision = self.decision.decide(command)
+        self._last_decision = decision
+        return INTENT_MAP.get(decision.intent, "GENERAL")
 
-BASIC OPERATIONS:
-• "What's the weather?"
-• "Take a screenshot"
-• "System status"
-• "Open calculator"
+    # ── Multi-step execution ─────────────────────────────────────────────────
 
-COMPOUND COMMANDS:
-• "Take screenshot then open calculator and type 2+2"
-• "Create file about space exploration then rename it to space.txt"
-• "Launch notepad, wait 2 seconds, then type 'Hello JARVIS!'"
-• "Get system health then take screenshot of the results"
+    _KEY_INTENTS = {"MEDIA", "SCREEN_AUTOMATION", "CONTROL"}   # send keys / change focus
 
-FILE OPERATIONS:
-• "Create a detailed file about machine learning"
-• "Create folder called projects then create file inside it"
-• "Read file config.py"
+    def _run_step(self, text, context):
+        """Route and run one step of a plan. ``context`` is per-lane (browser, media state)."""
+        from core.natural import tidy
+        text = tidy(text)                           # live voice: "uh, open spotify" → "open spotify"
+        intent = self._classify_command_intent(text)
+        if intent == "APP" and context.get("browser") and re.search(
+                r"^(?:go to|navigate to|visit|open|browse to|play)\b|\.\w{2,4}\b|\byoutube\b", text, re.I) \
+                and not self.command_processor.is_browser_launch(text):
+            return self.app_control.launch_app_by_name(text, browser=context["browser"])
+        if intent == "MEDIA" and context.get("media_started"):
+            # "…and move to the next video": wait until the video really plays.
+            waited = time.time() - context.pop("media_started")
+            if not self.windows.wait_for_playback(timeout=max(0.0, 12 - waited)) and waited < 6:
+                time.sleep(6 - waited)
+        lock = getattr(self, "_input_lock", None)
+        if lock is not None and intent in self._KEY_INTENTS:
+            with lock:
+                reply = self._handle_classified_command(text, intent, use_voice=False)
+        else:
+            reply = self._handle_classified_command(text, intent, use_voice=False)
+        return reply if reply is not None else self._fallback_brain(text)
 
-SCHEDULING:
-• "Schedule reminder to call mom in 30 minutes"
-• "Schedule daily system health check at 9 AM"
-• "List all scheduled tasks"
+    def _settle(self, text, reply, context):
+        """Give the desktop time to catch up before the next step in the same lane."""
+        self._remember_app(reply)
+        browser = self.command_processor.is_browser_launch(text)
+        if browser:
+            context["browser"] = browser
+            time.sleep(1.5)
+        elif "watch?v=" in reply or "Playing:" in reply or "youtube.com/results" in reply:
+            context["media_started"] = time.time()
+        elif reply.startswith("Opened"):
+            time.sleep(0.8)
 
-AUTOMATION:
-• "Click at 500,300 then type 'automated text'"
-• "Focus window notepad then press ctrl+a"
-• "Minimize all windows"
-
-AI SCREEN AUTOMATION:
-• "Click on File"
-• "Find and click Edit"
-• "Click on the save button"
-• "Press the OK button"
-• "Tap on Help"
-
-COMPLEX TASK AUTOMATION:
-• "Set alarm for 7:30 AM"
-• "Send email to john@example.com subject meeting reminder"
-• "Set reminder to call mom in 2 hours"
-• "Set timer for 10 minutes"
-• "Create document about artificial intelligence"
-• "Open website google.com"
-• "Take screenshot"
-
-SYSTEM MONITORING:
-• "Monitor performance for 5 minutes"
-• "Show detailed hardware information"
-• "Analyze network connections"
-"""
-            if use_voice:
-                self.voice_engine.speak("I've shown you example commands. Try any of these to see what I can do!")
-            console.print(Panel(examples.strip(), title="Command Examples", border_style="green"))
-            return
-
-        # AI Model Management Commands
-        if self.use_multi_model and ("list models" in command or "available models" in command):
-            models_info = self.multi_brain.list_available_models()
-            if use_voice:
-                self.voice_engine.speak("AI models list displayed.")
-            console.print(Panel(models_info, title="Available AI Models", border_style="blue"))
-            return
-        
-        if self.use_multi_model and command.startswith("switch model "):
-            model_name = command.replace("switch model ", "").strip()
-            result = self.multi_brain.switch_model(model_name)
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        if self.use_multi_model and ("current model" in command or "which model" in command):
-            model_info = self.multi_brain.get_model_info()
-            if "error" not in model_info:
-                info_text = f"""Current AI Model: {model_info['name']}
-Provider: {model_info['provider']}
-Description: {model_info['description']}
-Context Window: {model_info['context_window']:,} tokens
-Vision Support: {'Yes' if model_info['supports_vision'] else 'No'}
-Cost: ${model_info['cost_per_1k_tokens']}/1K tokens
-Conversation Length: {model_info['conversation_length']} messages"""
-                
-                if use_voice:
-                    self.voice_engine.speak(f"Currently using {model_info['name']}")
-                console.print(Panel(info_text, title="Current AI Model", border_style="cyan"))
-            else:
-                response = "No model information available"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if self.use_multi_model and ("benchmark models" in command or "test models" in command):
-            if use_voice:
-                self.voice_engine.speak("Running model benchmark. This may take a moment.")
-            
-            test_prompt = "Explain artificial intelligence in 50 words"
-            if "with" in command:
-                custom_prompt = command.split("with", 1)[1].strip()
-                if custom_prompt:
-                    test_prompt = custom_prompt
-            
-            benchmark_results = self.multi_brain.benchmark_models(test_prompt)
-            console.print(Panel(benchmark_results, title="Model Benchmark Results", border_style="yellow"))
-            
-            if use_voice:
-                self.voice_engine.speak("Model benchmark completed")
-            return
-        
-        if self.use_multi_model and ("model stats" in command or "usage stats" in command):
-            stats = self.multi_brain.get_usage_stats()
-            if use_voice:
-                self.voice_engine.speak("Model usage statistics displayed")
-            console.print(Panel(stats, title="AI Model Usage Statistics", border_style="green"))
-            return
-        
-        if "smart model" in command or "auto model" in command:
-            if self.use_multi_model:
-                # Analyze command to suggest best model
-                suggested_model = self._suggest_model_for_command(command)
-                if suggested_model and suggested_model != self.multi_brain.current_model:
-                    switch_result = self.multi_brain.switch_model(suggested_model)
-                    response = f"Switched to {suggested_model} for better performance. {switch_result}"
-                else:
-                    response = f"Current model {self.multi_brain.current_model} is optimal for this task."
-                
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            else:
-                response = "Smart model selection requires multi-model brain"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-
-        # Simple greetings and basic interactions with more natural responses
-        if command in ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "wyd", "what's up", "whats up"]:
-            import random
-            import datetime
-            hour = datetime.datetime.now().hour
-            
-            if command in ["wyd", "what's up", "whats up"]:
-                responses = [
-                    "Just monitoring system performance and standing by for your requests, sir.",
-                    "Running diagnostics and waiting for your next command.",
-                    "All systems nominal. Ready to assist with whatever you need.",
-                    "Keeping everything running smoothly while I wait for you to give me something interesting to do.",
-                    "Maintaining optimal performance and ready for action."
-                ]
-            elif 5 <= hour < 12:  # Morning
-                responses = [
-                    "Good morning, sir. All systems are online and ready.",
-                    "Morning! I trust you slept well. How may I assist you today?",
-                    "Good morning. Everything's running smoothly this morning.",
-                    "Rise and shine! I'm ready to help make your day productive."
-                ]
-            elif 12 <= hour < 17:  # Afternoon
-                responses = [
-                    "Good afternoon, sir. How may I be of service?",
-                    "Afternoon! I hope your day is going well. What can I help with?",
-                    "Good afternoon. All systems remain at peak efficiency.",
-                    "Afternoon, sir. Ready to tackle whatever you need."
-                ]
-            else:  # Evening
-                responses = [
-                    "Good evening, sir. How was your day?",
-                    "Evening! All systems secure and ready for whatever you need.",
-                    "Good evening. I trust everything is going well.",
-                    "Evening, sir. What can I help you with tonight?"
-                ]
-            
-            response = random.choice(responses)
-            if use_voice:
-                self.voice_engine.speak(response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-
-        # Mathematical expressions - prioritize over agent to avoid routing to unit conversion
-        import re
-        
-        # Detect simple math expressions (numbers with operators)
-        math_pattern = r'^(?:what\s+is\s+|whats\s+|calculate\s+|compute\s+|solve\s+|math\s+)?(\d+(?:\.\d+)?\s*[+\-*/^%]\s*\d+(?:\.\d+)?(?:\s*[+\-*/^%]\s*\d+(?:\.\d+)?)*)$'
-        math_match = re.search(math_pattern, command.replace('x', '*').replace('^', '**'))
-        
-        if math_match or any(phrase in command for phrase in ["what is", "whats"] if any(op in command for op in ['+', '-', '*', '/', 'x', '^', 'plus', 'minus', 'times', 'divided'])):
-            # Extract mathematical expression
-            expression = command
-            for phrase in ["what is", "whats", "calculate", "compute", "math", "solve", "tell me"]:
-                expression = expression.replace(phrase, "").strip()
-            
-            # Clean up the expression
-            expression = expression.replace('x', '*').replace('^', '**')
-            expression = expression.replace('plus', '+').replace('minus', '-')
-            expression = expression.replace('times', '*').replace('divided by', '/')
-            
-            if expression and any(op in expression for op in ['+', '-', '*', '/', '**', '%']):
-                result = self.utility_skill.calculate(expression)
-                
-                # More natural response
-                if "The result is:" in result:
-                    number = result.replace("The result is:", "").strip()
-                    natural_response = f"That equals {number}, sir."
-                else:
-                    natural_response = result
-                
-                if use_voice:
-                    self.voice_engine.speak(natural_response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {natural_response}")
-                return
-
-        # Clear conversation history
-        if "clear history" in command or "reset conversation" in command:
-            if self.use_multi_model:
-                result = self.multi_brain.clear_history()
-            elif self.use_advanced_brain:
-                result = self.openrouter_brain.clear_history()
-            else:
-                result = self.brain.clear_history()
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        # Screenshot commands
-        if "take screenshot" in command or "screenshot" in command:
-            if self.automation_skill:
-                result = self.system_control.take_screenshot()
-                if use_voice:
-                    self.voice_engine.speak("Screenshot captured.")
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {result}")
-            else:
-                response = "Screenshot functionality not available."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        # Mouse and automation commands
-        if command.startswith("click at ") and self.automation_skill:
-            try:
-                coords = command.replace("click at ", "").strip()
-                x, y = map(int, coords.split(","))
-                result = self.automation_skill.click_at(x, y)
-                if use_voice:
-                    self.voice_engine.speak("Clicked at coordinates.")
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {result}")
-            except:
-                response = "Invalid coordinates. Use format: click at x,y"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if command.startswith("type ") and self.automation_skill:
-            text = command.replace("type ", "").strip()
-            result = self.automation_skill.type_text(text)
-            if use_voice:
-                self.voice_engine.speak("Text typed.")
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        if command.startswith("press ") and self.automation_skill:
-            key = command.replace("press ", "").strip()
-            result = self.automation_skill.press_key(key)
-            if use_voice:
-                self.voice_engine.speak(f"Pressed {key} key.")
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        # Window management
-        if command.startswith("focus window ") and self.automation_skill:
-            window_title = command.replace("focus window ", "").strip()
-            result = self.automation_skill.focus_window(window_title)
-            if use_voice:
-                self.voice_engine.speak(f"Focused on {window_title} window.")
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        if command.startswith("close window ") and self.automation_skill:
-            window_title = command.replace("close window ", "").strip()
-            result = self.automation_skill.close_window(window_title)
-            if use_voice:
-                self.voice_engine.speak(f"Closed {window_title} window.")
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        if "list windows" in command and self.automation_skill:
-            result = self.automation_skill.get_window_list()
-            if use_voice:
-                self.voice_engine.speak("Window list displayed.")
-            console.print(Panel(result, title="Open Windows", border_style="cyan"))
-            return
-        
-        # Enhanced application commands
-        if command.startswith("launch ") or command.startswith("open "):
-            app_name = command.replace("launch ", "").replace("open ", "")
-            # Always use the stricter SystemControl launcher which verifies installation
-            result = self.system_control.launch_application(app_name)
-            
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        if command.startswith("close app ") and self.app_control:
-            app_name = command.replace("close app ", "").strip()
-            result = self.app_control.close_app_by_name(app_name)
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        if "list apps" in command and self.app_control:
-            filter_text = command.replace("list apps", "").strip()
-            result = self.app_control.list_installed_apps(filter_text)
-            if use_voice:
-                self.voice_engine.speak("Application list displayed.")
-            console.print(Panel(result, title="Installed Applications", border_style="green"))
-            return
-        
-        # Enhanced system commands
-        if "set volume" in command:
-            try:
-                volume = int(''.join(filter(str.isdigit, command)))
-                result = self.system_control.set_volume(volume)
-                if use_voice:
-                    self.voice_engine.speak(f"Volume set to {volume} percent.")
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {result}")
-            except:
-                response = "Please specify a volume level between 0 and 100."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if "battery" in command or "battery status" in command:
-            result = self.system_control.get_battery_info()
-            if use_voice:
-                self.voice_engine.speak("Battery information retrieved.")
-            console.print(Panel(result, title="Battery Status", border_style="yellow"))
-            return
-        
-        if "network info" in command or "network status" in command:
-            result = self.system_control.get_network_info()
-            if use_voice:
-                self.voice_engine.speak("Network information retrieved.")
-            console.print(Panel(result, title="Network Status", border_style="blue"))
-            return
-        
-        # RAM/Memory usage commands (minimal and natural)
-        if "ram usage" in command or "memory usage" in command or "whats the ram" in command:
-            status = self.system_control.get_memory_usage()
-            # Make it more conversational
-            if "Memory:" in status:
-                parts = status.split(": ", 1)[1]  # Remove "Memory: " prefix
-                natural_response = f"Your system is using {parts}, sir."
-            else:
-                natural_response = status
-            
-            if use_voice:
-                self.voice_engine.speak(natural_response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {natural_response}")
-            return
-
-        # CPU usage commands (minimal and natural)
-        if "cpu usage" in command or "processor usage" in command or "whats the cpu" in command:
-            status = self.system_control.get_cpu_usage()
-            # Make it more conversational
-            if "CPU Usage:" in status:
-                percentage = status.split(": ", 1)[1]  # Remove "CPU Usage: " prefix
-                natural_response = f"Your CPU is currently at {percentage}, sir."
-            else:
-                natural_response = status
-            
-            if use_voice:
-                self.voice_engine.speak(natural_response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {natural_response}")
-            return        # Quick system overview
-        if "system overview" in command or "quick status" in command:
-            status = self.system_control.get_system_status()
-            processes = self.system_control.get_running_processes(5)  # Top 5 processes
-            
-            combined_info = f"{status}\n\n{processes}"
-            
-            if use_voice:
-                self.voice_engine.speak("System overview retrieved.")
-            console.print(Panel(combined_info, title="Quick System Overview", border_style="cyan"))
-            return
-        
-        # Enhanced system monitoring commands
-        if "detailed system info" in command or "hardware info" in command:
-            if self.system_monitor:
-                if "hardware" in command:
-                    info = self.system_monitor.get_hardware_info()
-                else:
-                    info = self.system_monitor.get_detailed_system_info()
-                if use_voice:
-                    self.voice_engine.speak("Detailed system information retrieved.")
-                console.print(Panel(info, title="Detailed System Information", border_style="blue"))
-            else:
-                response = "Advanced system monitoring not available."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if "system health" in command or "health check" in command:
-            if self.system_monitor:
-                health = self.system_monitor.check_system_health()
-                if use_voice:
-                    self.voice_engine.speak("System health check completed.")
-                console.print(Panel(health, title="System Health Check", border_style="green"))
-            else:
-                response = "System health monitoring not available."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if "monitor performance" in command or "system performance" in command:
-            if self.system_monitor:
-                # Extract duration if specified
-                duration = 5  # default
-                if "for" in command:
-                    try:
-                        parts = command.split("for")[1].strip()
-                        duration = int(''.join(filter(str.isdigit, parts)))
-                    except:
-                        pass
-                
-                if use_voice:
-                    self.voice_engine.speak(f"Monitoring system performance for {duration} minutes")
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] Monitoring system performance for {duration} minutes")
-                
-                performance = self.system_monitor.monitor_performance(duration)
-                console.print(Panel(performance, title="Performance Monitoring", border_style="yellow"))
-                
-                if use_voice:
-                    self.voice_engine.speak("Performance monitoring completed")
-            else:
-                response = "Performance monitoring not available."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if "network analysis" in command or "network info" in command:
-            if self.system_monitor:
-                network_info = self.system_monitor.get_network_analysis()
-                if use_voice:
-                    self.voice_engine.speak("Network analysis completed.")
-                console.print(Panel(network_info, title="Network Analysis", border_style="cyan"))
-            else:
-                # Fallback to basic network info
-                result = self.system_control.get_network_info()
-                if use_voice:
-                    self.voice_engine.speak("Network information retrieved.")
-                console.print(Panel(result, title="Network Status", border_style="blue"))
-            return
-        
-        # Task scheduling commands
-        if ("schedule" in command or "remind" in command) and self.task_scheduler:
-            result = self.task_scheduler.process_schedule_command(command)
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        if "list tasks" in command or "show tasks" in command or "scheduled tasks" in command:
-            if self.task_scheduler:
-                tasks = self.task_scheduler.list_scheduled_tasks()
-                if use_voice:
-                    self.voice_engine.speak("Scheduled tasks displayed.")
-                console.print(Panel(tasks, title="Scheduled Tasks", border_style="purple"))
-            else:
-                response = "Task scheduler not available."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if command.startswith("run command "):
-            cmd = command.replace("run command ", "").strip()
-            result = self.system_control.run_command(cmd)
-            if use_voice:
-                self.voice_engine.speak("Command executed.")
-            console.print(Panel(result, title="Command Output", border_style="red"))
-            return
-        
-        # File management commands
-        if (command.startswith("create file") or command.startswith("make file") or 
-            "create a file" in command or "create a text" in command or 
-            ("create" in command and ("store" in command or "save" in command))):
-            
-            # Handle content creation requests
-            if "create a text about" in command or "create text about" in command:
-                # Extract topic and filename
-                parts = command.replace("create a text about", "").replace("create text about", "")
-                if "store it in" in parts or "save it" in parts:
-                    topic_and_location = parts.replace("store it in", "|").replace("save it", "|").replace("and", "")
-                    topic_parts = topic_and_location.split("|")
-                    topic = topic_parts[0].strip()
-                    location = topic_parts[1].strip() if len(topic_parts) > 1 else ""
-                    
-                    # Generate filename from topic
-                    filename = topic.replace(" ", "_").replace("for", "").replace("in", "").replace("2025", "2025").strip("_")
-                    if location and "desktop" not in location.lower():
-                        filename = location.strip()
-                    elif not filename:
-                        filename = "generated_text"
-                    
-                    # Add extension if not present
-                    if not filename.endswith('.txt'):
-                        filename += '.txt'
-                    
-                    # Generate content using AI
-                    content_request = f"Write a detailed text about {topic}"
-                    if self.use_advanced_brain:
-                        content = self.openrouter_brain.process_command(content_request)
-                    else:
-                        content = f"# {topic.title()}\n\nThis is a placeholder text about {topic}. Please provide more specific requirements for detailed content."
-                    
-                    # Create file with generated content
-                    result = self.file_skill.create_file(filename, content)
-                    # Remember last created file for later operations
-                    self.last_created_file = filename
-                    if use_voice:
-                        self.voice_engine.speak(f"I've created a text file about {topic} and saved it as {filename}")
-                    else:
-                        console.print(f"[blue]JARVIS:[/blue] I've created a text file about {topic} and saved it as {filename}")
-                    console.print(f"[green]{result}[/green]")
-                    return
-                
-            # Standard file creation
-            filename = command.replace("create file", "").replace("make file", "").replace("create a file", "").replace("named", "").replace("in this folder", "").replace("here", "").strip()
-            if not filename:
-                filename = "untitled"
-            result = self.file_skill.create_file(filename)
-            # Remember last created file
-            self.last_created_file = filename
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        if command.startswith("read file") or command.startswith("open file"):
-            filename = command.replace("read file", "").replace("open file", "").strip()
-            if filename:
-                result = self.file_skill.read_file(filename)
-                if use_voice:
-                    self.voice_engine.speak("File contents displayed.")
-                console.print(Panel(result, title="File Contents", border_style="cyan"))
-            else:
-                response = "Please specify a filename to read."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if command.startswith("delete file") or command.startswith("remove file"):
-            filename = command.replace("delete file", "").replace("remove file", "").strip()
-            if filename:
-                result = self.file_skill.delete_file(filename)
-                if use_voice:
-                    self.voice_engine.speak(result)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {result}")
-            else:
-                response = "Please specify a filename to delete."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if "list files" in command or "show files" in command:
-            result = self.file_skill.list_files()
-            if use_voice:
-                self.voice_engine.speak("File list displayed.")
-            console.print(Panel(result, title="File List", border_style="green"))
-            return
-        
-        if command.startswith("create folder") or command.startswith("make folder"):
-            foldername = command.replace("create folder", "").replace("make folder", "").strip()
-            if foldername:
-                result = self.file_skill.create_folder(foldername)
-                if use_voice:
-                    self.voice_engine.speak(result)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {result}")
-            else:
-                response = "Please specify a folder name."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if "current directory" in command or "where am i" in command:
-            result = self.file_skill.get_current_directory()
-            if use_voice:
-                self.voice_engine.speak(result)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {result}")
-            return
-        
-        # Rename file or folder
-        if "rename" in command and "to" in command:
-            # Extract parts
-            parts = command.split("to", 1)
-            old_part = parts[0]
-            new_name = parts[1].strip()
-            # Determine old_name, handle pronouns referring to last created file
-            if any(pronoun in old_part for pronoun in ["that file", "this file", "it"]) and self.last_created_file:
-                old_name = self.last_created_file
-            else:
-                # Fallback extraction by removing 'rename' keywords
-                old_name = old_part.replace("rename file", "").replace("rename", "").strip()
-            if not old_name or not new_name:
-                response = "Please provide both the current and new name."
-            else:
-                # Perform rename operation
-                result = self.file_skill.rename_file(old_name, new_name)
-                if result:
-                    # Update last_created_file if renamed
-                    if self.last_created_file == old_name:
-                        self.last_created_file = new_name
-                    response = f"Renamed '{old_name}' to '{new_name}'."
-                else:
-                    response = "Failed to rename the file or folder."
-            if use_voice:
-                self.voice_engine.speak(response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        # Direct automation command: "take screenshot then open calculator and type 2+2"
-        if ("take screenshot" in command and "calculator" in command and "2+2" in command) or \
-           ("screenshot" in command and "open calculator" in command):
-            if self.automation_skill:
-                response = "Executing: taking screenshot, opening calculator, and typing 2+2"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                
-                # Take screenshot
-                screenshot_result = self.system_control.take_screenshot()
-                console.print(f"[green]✅ {screenshot_result}[/green]")
-                
-                # Open calculator
-                calc_result = self.system_control.launch_application("calculator")
-                console.print(f"[green]✅ {calc_result}[/green]")
-                
-                # Wait for app to open
-                time.sleep(2)
-                
-                # Type calculation
-                type_result = self.automation_skill.type_text("2+2")
-                console.print(f"[green]✅ {type_result}[/green]")
-                
-                # Press equals or enter
-                enter_result = self.automation_skill.press_key("enter")
-                console.print(f"[green]✅ {enter_result}[/green]")
-                
-                final_response = "Task completed: Screenshot taken, calculator opened, and 2+2 calculated!"
-                if use_voice:
-                    self.voice_engine.speak(final_response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {final_response}")
-            else:
-                response = "Automation not available on this system."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        # Complex automation sequences
-        if "take a screenshot, then open calculator and type 2+2" in command or "take screenshot, then open calculator and type 2+2" in command:
-            if self.automation_skill:
-                response = "Executing sequence: screenshot, calculator, and typing 2+2"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                
-                # Take screenshot
-                screenshot_result = self.system_control.take_screenshot()
-                console.print(f"[green]✅ {screenshot_result}[/green]")
-                
-                # Wait a moment
-                time.sleep(1)
-                
-                # Open calculator
-                calc_result = self.system_control.launch_application("calculator")
-                console.print(f"[green]✅ {calc_result}[/green]")
-                
-                # Wait for calculator to open
-                time.sleep(3)
-                
-                # Type calculation
-                type_result = self.automation_skill.type_text("2+2")
-                console.print(f"[green]✅ {type_result}[/green]")
-                
-                # Press equals
-                time.sleep(0.5)
-                equals_result = self.automation_skill.press_key("enter")
-                console.print(f"[green]✅ {equals_result}[/green]")
-                
-                final_response = "Sequence completed: screenshot taken, calculator opened, and 2+2 calculated!"
-                if use_voice:
-                    self.voice_engine.speak(final_response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {final_response}")
-            else:
-                response = "Automation not available on this system."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if "demo automation" in command:
-            if self.automation_skill:
-                response = "Executing automation demo: taking screenshot, opening calculator, and typing 2+2"
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-                
-                # Take screenshot
-                self.system_control.take_screenshot()
-                console.print("[green]✅ Screenshot taken[/green]")
-                
-                # Open calculator
-                self.system_control.launch_application("calculator")
-                console.print("[green]✅ Calculator launched[/green]")
-                
-                # Wait a moment for app to open
-                time.sleep(2)
-                
-                # Type calculation
-                self.automation_skill.type_text("2+2")
-                console.print("[green]✅ Typed 2+2[/green]")
-                
-                # Press equals
-                self.automation_skill.press_key("enter")
-                console.print("[green]✅ Calculation executed[/green]")
-                
-                final_response = "Automation demo completed successfully!"
-                if use_voice:
-                    self.voice_engine.speak(final_response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {final_response}")
-            else:
-                response = "Automation not available on this system."
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            return
-        
-        if "system report" in command or "full system report" in command:
-            response = "Generating comprehensive system report..."
-            if use_voice:
-                self.voice_engine.speak(response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-            
-            # Collect all system information
-            status = self.system_control.get_system_status()
-            processes = self.system_control.get_running_processes()
-            disk_info = self.system_control.get_disk_usage()
-            network_info = self.system_control.get_network_info()
-            battery_info = self.system_control.get_battery_info()
-            
-            # Create comprehensive report
-            report = f"""JARVIS SYSTEM REPORT
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-+
-{status}
-+
-{processes}
-+
-{disk_info}
-+
-{network_info}
-+
-{battery_info}
-"""
-            
-            # Save report to file
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"system_report_{timestamp}.txt"
-            self.file_skill.create_file(filename, report)
-            
-            # Display summary
-            console.print(Panel(report, title="System Report", border_style="green"))
-            
-            final_response = f"System report saved as {filename}"
-            if use_voice:
-                self.voice_engine.speak(final_response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {final_response}")
-            return
-        
-        # Enhanced compound command processing
-        if self.command_processor and any(keyword in command for keyword in ["then", "and then", "after", ";"]):
-            try:
-                # Parse the complex command
-                steps = self.command_processor.parse_complex_command(command)
-                
-                if len(steps) > 1:
-                    response = f"Executing compound command with {len(steps)} steps..."
-                    if use_voice:
-                        self.voice_engine.speak(response)
-                    else:
-                        console.print(f"[blue]JARVIS:[/blue] {response}")
-                    
-                    # Execute the parsed steps
-                    results = self.command_processor.execute_parsed_commands(steps, use_voice)
-                    
-                    # Show execution summary
-                    summary = "Command sequence completed:\n"
-                    for i, result in enumerate(results, 1):
-                        summary += f"{i}. {result}\n"
-                    
-                    console.print(Panel(summary.strip(), title="Compound Command Results", border_style="green"))
-                    
-                    if use_voice:
-                        self.voice_engine.speak("All command steps completed successfully")
-                    
-                    return
-                    
-            except Exception as e:
-                error_msg = f"Error processing compound command: {e}"
-                console.print(f"[red]{error_msg}[/red]")
-                if use_voice:
-                    self.voice_engine.speak("Sorry, I had trouble processing that compound command")
-                # Fall through to regular processing
-
-         # Default: Use agent orchestrator if available, else AI brain fallback
-        try:
-            if self.agent_available and hasattr(self, 'agent'):
-                response = self.agent.run(command)
-            else:
-                response = self._fallback_brain(command)
-            if use_voice:
-                self.voice_engine.speak(response)
-            else:
-                console.print(f"[blue]JARVIS:[/blue] {response}")
-        except Exception as e:
-            console.print(f"[yellow]Agent processing failed (likely rate limit): {e}[/yellow]")
-            # Try direct fallback brain processing
-            try:
-                response = self._fallback_brain(command)
-                if use_voice:
-                    self.voice_engine.speak(response)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {response}")
-            except Exception as fallback_error:
-                error_msg = "I'm sorry, I encountered an error processing that request. Please try a more specific command."
-                console.print(f"[red]Processing error: {fallback_error}[/red]")
-                if use_voice:
-                    self.voice_engine.speak(error_msg)
-                else:
-                    console.print(f"[blue]JARVIS:[/blue] {error_msg}")
-    
-    def _fallback_brain(self, command):
-        """Fallback to brain logic based on available systems"""
-        try:
-            if self.use_multi_model:
-                return self.multi_brain.process_command(command)
-            elif self.use_advanced_brain:
-                return self.openrouter_brain.process_command(command)
-            else:
-                return self.brain.process_command(command)
-        except Exception as e:
-            # If all AI systems fail, try basic pattern matching for common tasks
-            return self._basic_fallback_processing(command)
-    
-    def _basic_fallback_processing(self, command):
-        """Handle basic commands without requiring API keys"""
-        command_lower = command.lower()
-        
-        # Basic math detection and calculation
-        if any(op in command_lower for op in ['+', '-', '*', '/', '×', '÷']):
-            if any(char.isdigit() for char in command):
+    def new_execution_session(self, on_event=None, voice=False):
+        """``voice=True``: steps come from live voice, so confirmations are asked out loud."""
+        from core.executor import ExecutionSession
+        if getattr(self, "_input_lock", None) is None:
+            self._input_lock = threading.Lock()
+        if getattr(self, "_stop_plan", None) is not None:
+            self._stop_plan.clear()           # a stop only applies to work that was already running
+        run_step = self._run_step
+        if voice:
+            def run_step(text, context, _run=self._run_step):
+                _ORIGIN.voice = True
                 try:
-                    # Simple math processing
-                    import re
-                    math_query = command_lower
-                    
-                    # Remove common question words
-                    math_query = re.sub(r'\b(what\s+is|whats|what\'s|calculate|math|compute|solve|tell\s+me|can\s+you\s+tell\s+me)\b', '', math_query).strip()
-                    
-                    # Replace word operators
-                    math_query = re.sub(r'\bplus\b', '+', math_query)
-                    math_query = re.sub(r'\bminus\b', '-', math_query)
-                    math_query = re.sub(r'\btimes\b', '*', math_query)
-                    math_query = re.sub(r'\bmultiplied\s+by\b', '*', math_query)
-                    math_query = re.sub(r'\bdivided\s+by\b', '/', math_query)
-                    math_query = re.sub(r'\bx\b', '*', math_query)
-                    
-                    # Clean up spaces
-                    math_query = re.sub(r'\s+', '', math_query)
-                    
-                    # Evaluate simple expressions
-                    if re.match(r'^[-+]?\d*\.?\d+[+\-*/][-+]?\d*\.?\d+$', math_query):
-                        result = eval(math_query)
-                        return f"{command.strip()} = {result}"
-                    
-                except:
-                    pass
-        
-        # Basic greetings
-        if any(word in command_lower for word in ['hello', 'hi', 'hey']):
-            return "Hello! How can I help you today?"
-        
-        # Basic time
-        if any(phrase in command_lower for phrase in ['what time', 'current time', 'time now']):
-            from datetime import datetime
-            current_time = datetime.now().strftime("%I:%M %p")
-            return f"The current time is {current_time}."
-        
-        # Basic date
-        if any(phrase in command_lower for phrase in ['what date', 'current date', 'date today', 'today']):
-            from datetime import datetime
-            current_date = datetime.now().strftime("%A, %B %d, %Y")
-            return f"Today is {current_date}."
-        
-        # Basic jokes
-        if any(word in command_lower for word in ['joke', 'funny', 'laugh']):
-            return "Why don't scientists trust atoms? Because they make up everything!"
-        
-        # Default response
-        return f"I understand you want help with: {command}. Please configure your API keys in Settings for full functionality."
-    
-    def _suggest_model_for_command(self, command: str) -> str:
-        """Suggest the best model for a given command"""
-        command_lower = command.lower()
-        
-        # Check for specific task types
-        if any(keyword in command_lower for keyword in ["code", "programming", "debug", "script", "function"]):
-            return "deepseek-coder"
-        elif any(keyword in command_lower for keyword in ["analyze", "reasoning", "logic", "complex"]):
-            return "deepseek-v3"
-        elif any(keyword in command_lower for keyword in ["creative", "story", "poem", "artistic"]):
-            return "gpt-4o" if "gpt-4o" in self.multi_brain.available_models else "claude-3.5-sonnet"
-        elif any(keyword in command_lower for keyword in ["image", "picture", "visual", "screenshot"]):
-            vision_models = ["gemini-pro-vision", "gpt-4o", "claude-3.5-sonnet"]
-            for model in vision_models:
-                if model in self.multi_brain.available_models:
-                    return model
-        elif any(keyword in command_lower for keyword in ["fast", "quick", "simple"]):
-            return "gemini-flash" if "gemini-flash" in self.multi_brain.available_models else "qwen-2.5-vl"
-        
-        # Default to current model
-        return self.multi_brain.current_model
-    
-    def run_text_mode(self):
-        """Run JARVIS in text-only mode"""
-        console.print("[cyan]JARVIS Text Mode - Type your commands[/cyan]")
-        console.print("[dim]Type 'exit', 'quit', or 'goodbye' to exit[/dim]")
-        console.print("[dim]Type 'voice on' to enable voice responses[/dim]")
-        console.print("[dim]Voice commands: 'list voices', 'change voice [number/name]', 'test voice'[/dim]")
-        
-        use_voice = False
-        
+                    return _run(text, context)
+                finally:
+                    _ORIGIN.voice = False
+        session = ExecutionSession(run_step, self._settle, on_event)
+        self._active_session = session
+        return session
+
+    def _run_plan(self, plan):
+        def progress(kind, info):
+            if kind == "step_started":
+                console.print(f"[cyan]Step {info['index'] + 1}/{len(plan.steps)} (lane {info['lane'] + 1}):[/cyan] "
+                              f"{info['text']}")
+        with _PENDING_LOCK:
+            before = {id(p) for p in (getattr(self, "_pending_actions", None) or [])}
+        session = self.new_execution_session(progress)
+        last_lane = 0
+        for step in plan.steps:
+            session.submit(step.text, parallel=step.lane != last_lane, kind=step.kind, seconds=step.seconds)
+            last_lane = step.lane
+        session.close_and_wait()
+        self._order_plan_confirmations(session, before)
+        return self.format_session(session)
+
+    def _order_plan_confirmations(self, session, before):
+        """Parallel lanes queue their yes/no prompts in whatever order they finish, but the reply lists
+        them in step order — and "yes" answers the first one. Line the queue up with what was shown."""
+        with _PENDING_LOCK:
+            queue = getattr(self, "_pending_actions", None)
+            if not queue:
+                return
+            def step_of(p):
+                return next((s.index for s in session.steps if p["prompt"] and p["prompt"] in (s.reply or "")),
+                            len(session.steps))
+            old = [p for p in queue if id(p) in before]
+            new = sorted((p for p in queue if id(p) not in before), key=step_of)
+            now = time.monotonic()
+            for p in new:
+                p["created"] = now      # nobody has seen these prompts until the plan's reply arrives
+            queue[:] = old + new
+
+    @staticmethod
+    def format_session(session):
+        lanes = {s.lane for s in session.steps}
+        head = f"Ran {len(session.steps)} steps" + (f" in {len(lanes)} parallel lanes" if len(lanes) > 1 else "") + ":"
+        lines = [head]
+        for s in session.steps:
+            tag = f"[{s.lane + 1}] " if len(lanes) > 1 else ""
+            lines.append(f"{s.index + 1}. {tag}{s.text} → {s.reply or s.status}")
+        return "\n".join(lines)
+
+    def stop_current_task(self):
+        if getattr(self, "_stop_plan", None) is not None:
+            self._stop_plan.set()
+        session = getattr(self, "_active_session", None)
+        if session is not None:
+            session.stop()
+        if getattr(self, "screen_automation", None):
+            try:
+                self.screen_automation.stop_automation()
+            except Exception:
+                log.exception("stopping screen automation failed")
+
+    # ── Meta commands ────────────────────────────────────────────────────────
+
+    def _meta_command(self, original, bare):
+        brain = getattr(self, "brain", None)
+        if bare in ("help", "what can you do", "commands", "show commands", "capabilities"):
+            return HELP_TEXT
+        if bare in ("list models", "show models", "available models", "which models"):
+            return brain.list_available_models() if brain else "The AI brain is offline."
+        m = re.match(r"^(?:switch|change|use)(?: to)?(?: the)? model\s+(?:to\s+)?(.+)$|^use\s+(\S+)\s+model$", bare)
+        offline = "The AI brain is offline."
+        if m:
+            return brain.switch_model((m.group(1) or m.group(2)).strip()) if brain else offline
+        if bare in ("benchmark models", "benchmark", "test models"):
+            return brain.benchmark_models() if brain else offline
+        if bare in ("model stats", "usage stats", "model info"):
+            return brain.get_usage_stats() if brain else offline
+        if bare in ("clear history", "clear conversation", "forget this conversation") and brain:
+            return brain.clear_history()
+        if bare in ("decision status", "laya status", "router status"):
+            d = self.decision
+            return (f"{d.describe()}. Engine setting: {d.engine}, model: {d.model}, "
+                    f"threshold: {d.threshold:.2f}.")
+        if bare in ("refresh models", "update models", "scan models"):
+            return brain.refresh_catalog() if brain else offline
+        if bare in ("stop", "stop automation", "abort", "cancel task", "stop task"):
+            screen = getattr(self, "screen_automation", None)
+            session = getattr(self, "_active_session", None)
+            if (screen and getattr(screen, "is_running", False)) or (session is not None and session.busy):
+                self.stop_current_task()
+                return "Stopping the current task."
+        return None
+
+    # ── Handlers ─────────────────────────────────────────────────────────────
+
+    @property
+    def handlers(self):
+        """Per-domain intent handlers (handlers/); built on first use."""
+        registry = self.__dict__.get("_handlers")
+        if registry is None:
+            from handlers import HandlerRegistry
+            registry = self._handlers = HandlerRegistry(self)
+        return registry
+
+    def _handle_classified_command(self, command, intent, use_voice=True):
+        """Handle a classified command and return the reply (None → language model)."""
+        if intent == "EXIT":
+            return self.process_command("exit", use_voice)
+        return self.handlers.dispatch(command, intent)
+
+    def _set_alarm(self, command, use_voice=True):
+        return self.handlers["ScheduleHandler"].set_alarm(command)
+
+    # ── Language model fallback ──────────────────────────────────────────────
+
+    def _fallback_brain(self, command):
+        """Send to the language model (with tools). Offline: explain what still works."""
+        try:
+            if getattr(self, "brain", None) is not None and self.brain.current_model:
+                return self.brain.process_command(command, use_context=True)
+        except Exception as exc:
+            log.exception("brain failed")
+            return f"The AI model failed: {exc}"
+        return self._basic_fallback_processing(command)
+
+    def _basic_fallback_processing(self, command):
+        return ("I can't answer that without an AI model. Add an OpenRouter or Gemini key in Settings, or "
+                "install Ollama for offline chat. Meanwhile I can still open apps, control media and volume, "
+                "manage files, set alarms, check the weather and system status — say 'help' for examples.")
+
+    # ── Tools for the language model ─────────────────────────────────────────
+
+    def _register_tools(self):
+        self.handlers.register_tools(self.tools)
+        plugin_names = getattr(self.handlers, "plugin_names", None)
+        if plugin_names:
+            console.print(f"[cyan]🔌 Loaded {len(plugin_names)} plugin(s) from "
+                          f"{self.handlers.plugin_dir}: {', '.join(plugin_names)}[/cyan]")
+
+    # ── Run loops ────────────────────────────────────────────────────────────
+
+    def run_text_mode(self, use_voice=False):
+        self._console_mode = True
+        console.print("[cyan]JARVIS text mode — type a command ('help' for ideas, 'exit' to quit).[/cyan]")
+        console.print("[dim]'voice on' / 'voice off' toggles spoken replies.[/dim]")
         while self.is_running:
             try:
                 command = input("\n[You]: ").strip()
-                
                 if not command:
                     continue
-                
-                # Toggle voice mode
-                if command.lower() in ['voice on', 'enable voice']:
+                low = command.lower()
+                if low in ("voice on", "enable voice"):
                     use_voice = True
                     console.print("[blue]JARVIS:[/blue] Voice responses enabled.")
                     continue
-                elif command.lower() in ['voice off', 'disable voice']:
+                if low in ("voice off", "disable voice"):
                     use_voice = False
                     console.print("[blue]JARVIS:[/blue] Voice responses disabled.")
                     continue
-                
-                # Voice control commands
-                elif command.lower() in ['list voices', 'show voices', 'available voices']:
-                    self.voice_engine.list_available_voices()
-                    continue
-                elif command.lower().startswith('change voice'):
-                    # Extract voice number or name
-                    parts = command.split()
-                    if len(parts) > 2:
-                        try:
-                            voice_id = int(parts[2])
-                            self.voice_engine.change_voice(voice_id)
-                        except ValueError:
-                            voice_name = ' '.join(parts[2:])
-                            self.voice_engine.change_voice(voice_name)
-                    else:
-                        console.print("[blue]JARVIS:[/blue] Please specify a voice number or name. Use 'list voices' to see options.")
-                    continue
-                elif command.lower() in ['test voice', 'voice test']:
-                    self.voice_engine.test_current_voice()
-                    continue
-                
-                if command.lower() in ['exit', 'quit', 'goodbye']:
+                if low in ("exit", "quit", "goodbye"):
                     console.print("[blue]JARVIS:[/blue] Goodbye!")
                     break
-                
-                # Process command
                 self.process_command(command, use_voice=use_voice)
-                
             except KeyboardInterrupt:
-                console.print("\n[yellow]Text mode interrupted by user[/yellow]")
+                console.print("\n[yellow]Interrupted.[/yellow]")
                 break
             except EOFError:
-                console.print("\n[yellow]Text mode ended (EOF)[/yellow]")
                 break
             except Exception as e:
-                console.print(f"[red]Text mode error: {e}[/red]")
-    
-    def start(self, mode="text"):
-        """Start JARVIS in specified mode"""
-        self.is_running = True
-        
-        # Welcome message
-        welcome_msg = self.brain.get_personality_response("startup")
-        
-        if mode == "voice":
-            # Check if voice recognition is available
-            if self.voice_engine.sr_available:
-                console.print("[green]🎤 Starting JARVIS in full voice mode...[/green]")
-                self.run_voice_mode()
-            else:
-                # Fallback to text mode with voice responses
-                console.print("[yellow]⚠️ Voice recognition not available. Using text input with voice responses.[/yellow]")
-                self.voice_engine.speak(welcome_msg)
-                self.run_text_mode_with_voice()
-        elif mode == "text":
-            console.print(f"[blue]JARVIS:[/blue] {welcome_msg}")
-            self.run_text_mode()
-        else:
-            console.print("[red]Invalid mode. Use 'voice' or 'text'[/red]")
-    
+                log.exception("text mode error")
+                console.print(f"[red]Error: {e}[/red]")
+
     def run_text_mode_with_voice(self):
-        """Run text mode but with voice responses enabled by default"""
-        console.print("[cyan]JARVIS Voice Mode - Type your commands, JARVIS will speak responses[/cyan]")
-        console.print("[dim]Type 'exit', 'quit', or 'goodbye' to exit[/dim]")
-        console.print("[dim]Type 'voice off' to disable voice responses[/dim]")
-        
-        use_voice = True
-        
-        while self.is_running:
-            try:
-                command = input("\n[You]: ").strip()
-                
-                if not command:
-                    continue
-                
-                # Toggle voice mode
-                if command.lower() in ['voice off', 'disable voice']:
-                    use_voice = False
-                    console.print("[blue]JARVIS:[/blue] Voice responses disabled.")
-                    continue
-                elif command.lower() in ['voice on', 'enable voice']:
-                    use_voice = True
-                    self.voice_engine.speak("Voice responses enabled.")
-                    continue
-                
-                if command.lower() in ['exit', 'quit', 'goodbye']:
-                    if use_voice:
-                        self.voice_engine.speak("Goodbye!")
-                    else:
-                        console.print("[blue]JARVIS:[/blue] Goodbye!")
-                    break
-                
-                # Process command
-                self.process_command(command, use_voice=use_voice)
-                
-            except KeyboardInterrupt:
-                console.print("\n[yellow]Voice mode interrupted by user[/yellow]")
-                break
-            except Exception as e:
-                console.print(f"[red]Voice mode error: {e}[/red]")
-    
-    def run_voice_mode(self):
-        """Run JARVIS in full voice mode with wake word detection"""
-        if not self.voice_engine.sr_available:
-            console.print("[red]❌ Voice recognition not available. Falling back to text mode with voice responses.[/red]")
+        self.run_text_mode(use_voice=True)
+
+    def _welcome(self):
+        try:
+            return self.brain.get_personality_response("startup") if self.brain else "JARVIS online."
+        except Exception:
+            log.exception("welcome message failed")
+            return "JARVIS online."
+
+    def start(self, mode="text"):
+        self.is_running = True
+        try:
+            self._report_missed_tasks()
+        except Exception:
+            log.exception("missed-task report failed")
+        welcome = self._welcome()
+        if mode == "voice" and getattr(self.voice_engine, "sr_available", False):
+            self.run_voice_mode()
+        elif mode == "voice":
+            console.print("[yellow]Speech recognition unavailable — text input with spoken replies.[/yellow]")
+            self.voice_engine.speak(welcome)
             self.run_text_mode_with_voice()
+        else:
+            console.print(f"[blue]JARVIS:[/blue] {welcome}")
+            self.run_text_mode()
+
+    def _report_missed_tasks(self):
+        scheduler = getattr(self, "task_scheduler", None)
+        if scheduler is None:
             return
-            
-        console.print("[cyan]🎤 JARVIS Voice Mode - Say 'JARVIS' to wake me up[/cyan]")
-        console.print("[dim]Press Ctrl+C to exit voice mode[/dim]")
-        
-        # Greet user in voice mode
-        greeting = self.get_time_greeting()
-        welcome_msg = random.choice(self.brain.responses["greeting"])
-        
-        console.print(f"[blue]JARVIS:[/blue] {welcome_msg}")
-        self.voice_engine.speak(welcome_msg)
-        
-        console.print("[yellow]🔄 Listening for wake word...[/yellow]")
-        
+        warning = getattr(scheduler, "storage_warning", "")
+        if isinstance(warning, str) and warning:
+            scheduler.storage_warning = ""
+            self.notify(warning)
+        for task in scheduler.missed_tasks():
+            when = (task.get("next_run") or "")[:16].replace("T", " ")
+            what = re.sub(r"^(reminder|alarm):\s*", "", task.get("description", ""))
+            self.notify(f"While I was offline you missed: {what or task.get('type')} ({when}).")
+
+    def run_voice_mode(self):
+        self._voice_mode = True
+        if self._run_live_voice_cli():
+            self._voice_mode = False
+            return
+        wake = Config.WAKE_WORD
+        greeting = self._welcome()
+        console.print(f"[cyan]🎤 Voice mode — say '{wake}' to wake me. Ctrl+C to quit.[/cyan]")
+        self.voice_engine.speak(greeting)
         while self.is_running:
             try:
-                # Listen for wake word
-                if self.voice_engine.listen_for_wake_word():
-                    # Wake word detected, get command
-                    self.voice_engine.speak("Yes?")
-                    
-                    command = self.voice_engine.listen_for_command(timeout=10, phrase_timeout=3)
-                    
-                    if command:
-                        # Check for exit commands
-                        if any(word in command for word in ["goodbye", "exit", "quit", "shutdown"]):
-                            self.voice_engine.speak("Goodbye!")
-                            break
-                        
-                        # Process the command with voice response
-                        self.process_command(command, use_voice=True)
-                    else:
-                        self.voice_engine.speak("I didn't catch that. Please try again.")
-                    
-                    console.print("[yellow]🔄 Listening for wake word...[/yellow]")
-                
+                if not self.voice_engine.listen_for_wake_word():
+                    continue
+                self.voice_engine.speak("Yes?")
+                command = self.voice_engine.listen_for_command(timeout=8)
+                if not command:
+                    self.voice_engine.speak("I didn't catch that.")
+                    continue
+                if re.fullmatch(r"(goodbye|exit|quit|stop listening)( jarvis)?", command.strip().lower().rstrip(".!? ")):
+                    self.voice_engine.speak("Goodbye!")
+                    break
+                self.process_command(command, use_voice=True)
             except KeyboardInterrupt:
-                console.print("\n[yellow]Voice mode interrupted by user[/yellow]")
                 break
             except Exception as e:
+                log.exception("voice loop error")
                 console.print(f"[red]Voice mode error: {e}[/red]")
-                time.sleep(1)  # Brief pause before retrying
-    
+                time.sleep(1)
+        self._voice_mode = False
+
+    def start_live_voice(self, on_event=None, require_wake_word=False, on_status=None):
+        """Start act-while-you-speak voice. Returns the listener (call .stop()) or None if unavailable."""
+        from core import streaming
+        if not (Config.LIVE_VOICE and streaming.vosk_available()):
+            return None
+        path = streaming.ensure_model(on_progress=on_status or (lambda m: self.notify(m)))
+        if path is None:
+            return None
+        session = streaming.StreamingSession(self, on_event=on_event, act_mode=Config.ACT_MODE,
+                                             require_wake_word=require_wake_word)
+        listener = streaming.StreamingListener(session, self.voice_engine,
+                                               device_index=self.voice_engine.selected_mic_index, model_path=path)
+        self.stream = session
+        self._live_listener = listener
+
+        def run():
+            try:
+                listener.run()
+            except ModuleNotFoundError as exc:
+                from core.deps import missing_package_message
+                log.exception("live voice failed")
+                if on_status:
+                    try:
+                        on_status(missing_package_message(exc, "Live voice"))
+                    except Exception:
+                        pass
+            except Exception as exc:
+                log.exception("live voice failed")
+                if on_status:
+                    try:
+                        on_status(f"Live voice stopped: {exc}")
+                    except Exception:
+                        pass
+            finally:
+                if getattr(self, "stream", None) is session:
+                    self.stream = None
+                if getattr(self, "_live_listener", None) is listener:
+                    self._live_listener = None
+        self._live_thread = threading.Thread(target=run, name="LiveVoice", daemon=True)
+        self._live_thread.start()
+        return listener
+
+    def _run_live_voice_cli(self):
+        """Terminal voice mode with live, act-while-speaking recognition."""
+        done = threading.Event()
+
+        def on_event(kind, info):
+            if kind == "partial":
+                console.print(f"[dim]… {info['text']}[/dim]", end="\r")
+            elif kind == "dispatched":
+                console.print(f"\n[cyan]▶ {info['text']}[/cyan]  [dim](lane {info['lane'] + 1})[/dim]")
+            elif kind == "utterance_done":
+                console.print(f"[blue]JARVIS:[/blue] {info['details']}")
+                self.voice_engine.speak(info["summary"], summarize=True)
+
+        listener = self.start_live_voice(on_event, require_wake_word=True, on_status=lambda m: console.print(m))
+        if listener is None:
+            return False
+        console.print(f"[cyan]🎤 Live voice — say '{Config.WAKE_WORD} …' and keep talking; I act as you speak. "
+                      f"Ctrl+C to quit.[/cyan]")
+        thread = getattr(self, "_live_thread", None)
+        try:
+            # Also end when the listener dies (mic unplugged, model error), not only on exit.
+            while self.is_running and (thread is None or thread.is_alive()) and not done.wait(0.5):
+                pass
+        except KeyboardInterrupt:
+            pass
+        listener.stop()
+        return True
+
     def get_time_greeting(self):
-        """Get appropriate greeting based on time of day"""
         hour = datetime.now().hour
-        
-        if 5 <= hour < 12:
-            return "morning"
-        elif 12 <= hour < 17:
-            return "afternoon"
-        elif 17 <= hour < 21:
-            return "evening"
-        else:
-            return "evening"
-    
+        return "morning" if 5 <= hour < 12 else "afternoon" if hour < 17 else "evening"
+
     def shutdown(self):
-        """Gracefully shutdown JARVIS"""
-        console.print("[yellow]Initiating JARVIS shutdown sequence...[/yellow]")
-        
+        """Stop background work. The caller (CLI loop or GUI) decides whether to exit."""
+        console.print("[yellow]JARVIS shutting down...[/yellow]")
         self.is_running = False
-        
-        console.print("[green]JARVIS systems offline. Goodbye![/green]")
-        sys.exit(0)
+        try:
+            self.stop_current_task()
+        except Exception:
+            log.exception("stopping the current task failed")
+        listener = getattr(self, "_live_listener", None)
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception:
+                log.exception("stopping live voice failed")
+            self._live_listener = None
+        try:
+            if getattr(self, "task_scheduler", None):
+                self.task_scheduler.stop_scheduler()
+        except Exception as e:
+            log.warning("Scheduler shutdown: %s", e)
+        for name, stop in (("clipboard history", lambda: self.productivity.clipboard_history.stop()),
+                           ("watchers", lambda: self.watchers.stop()),
+                           ("web dashboard", lambda: self.web_dashboard.running and self.web_dashboard.stop())):
+            try:
+                stop()
+            except AttributeError:
+                pass                # that skill failed to load
+            except Exception:
+                log.exception("stopping %s failed", name)
+        callback = getattr(self, "exit_callback", None)
+        if callback:
+            try:
+                callback()
+            except Exception:
+                log.exception("exit callback failed")
+
 
 def main():
-    """Main entry point"""
     try:
-        # Create JARVIS instance
         jarvis = JARVIS()
-        
-        # Check command line arguments
+        jarvis.install_signal_handlers()
         if len(sys.argv) > 1:
-            # If arguments provided, check if it's a mode or a direct command
-            first_arg = sys.argv[1].lower()
-            
-            if first_arg in ["voice", "text"]:
-                # Mode specified
-                jarvis.start(first_arg)
+            first = sys.argv[1].lower()
+            if first in ("voice", "text"):
+                jarvis.start(first)
             else:
-                # Direct command provided - process it immediately
                 command = " ".join(sys.argv[1:])
-                console.print(f"[blue]Processing command:[/blue] {command}")
-                response = jarvis.process_command(command)
-                if response:
-                    console.print(f"[green]JARVIS:[/green] {response}")
+                jarvis._console_mode = True
+                jarvis.process_command(command, use_voice=False)
+                jarvis.shutdown()
         else:
-            # No arguments - default to text mode
             jarvis.start("text")
-            
+            jarvis.shutdown()
     except KeyboardInterrupt:
-        console.print("\n[yellow]JARVIS startup interrupted[/yellow]")
+        console.print("\n[yellow]JARVIS interrupted.[/yellow]")
     except Exception as e:
+        log.exception("startup failed")
         console.print(f"[red]Failed to start JARVIS: {e}[/red]")
-        console.print("[yellow]Please check that all dependencies are installed[/yellow]")
+        console.print("[yellow]Check that dependencies are installed: pip install -r requirements.txt[/yellow]")
+
 
 if __name__ == "__main__":
     main()

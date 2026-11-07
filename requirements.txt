@@ -1,36 +1,67 @@
-pyttsx3
-psutil
-colorama
-rich
-requests
-SpeechRecognition
-pyaudio
-beautifulsoup4
-lxml
-wikipedia
-feedparser
-python-dotenv
-aiohttp
-websockets
-mcp
-google-generativeai
-selenium
-webdriver-manager
-scrapy
-langchain>=0.0.444
-langchain-openai
-langchain-core
-pydantic>=2.7.2,<3.0.0
-pyautogui
-pynput
-pillow
-pywin32
-pycaw
-winshell
-schedule
-wmi
-pytz
-asteval
-tzlocal
-PySide6==6.7.3
-pyinstaller==6.10.0
+# JARVIS — Python 3.10+ (tested on 3.11-3.14, Windows 10/11)
+# Install:  python -m pip install -r requirements.txt
+
+# Core
+requests>=2.31
+python-dotenv>=1.0
+rich>=13.5
+psutil>=5.9
+schedule>=1.2
+beautifulsoup4>=4.12
+Pillow>=10.0
+pyautogui>=0.9.54
+pynput>=1.7
+send2trash>=1.8
+
+# GUI (includes the embedded Chromium browser)
+PySide6>=6.8
+
+# Local decision model (Laya, Apache-2.0). Pulls in PyTorch (CPU build by default)
+# and downloads ~0.8 GB of weights from Hugging Face on first start.
+# Without it JARVIS still works using rule-based routing.
+laya>=0.3.5
+
+# Voice
+edge-tts>=6.1
+pyttsx3>=2.90
+SpeechRecognition>=3.10
+standard-aifc; python_version >= "3.13"
+audioop-lts; python_version >= "3.13"
+# Live voice: acts on each command while you're still speaking (offline).
+# The speech model (Indian English, ~1 GB) downloads on first use.
+vosk>=0.3.45
+# Local speech (core/local_speech.py): Whisper hears, Kokoro speaks — no cloud.
+# Models (~340 MB voice, ~0.5 GB Whisper) download on first use. On an NVIDIA GPU,
+# Whisper runs through the PyTorch above (install a CUDA build of torch for that).
+faster-whisper>=1.1
+kokoro-onnx>=0.4.7
+soundfile>=0.12
+sounddevice>=0.4
+
+# Microphone input for SpeechRecognition. Installed separately (not with the
+# block above) because it compiles a C extension against PortAudio and has no
+# prebuilt wheel on every Python version — a failure here would otherwise
+# abort installing everything else in this file. setup.py and
+# build_installer.bat both install it as their own best-effort step after
+# this file, and JARVIS runs fine without it (voice input just stays
+# unavailable). If it fails to build for you: install PortAudio dev headers
+# (e.g. via vcpkg: vcpkg install portaudio, then set VCPKG_PATH) and retry
+# `pip install PyAudio`, or use a Python version with a prebuilt wheel
+# (3.10-3.12 usually have one). See SETUP_GUIDE.md.
+#   PyAudio>=0.2.14
+
+# Windows integration
+pywin32>=306; sys_platform == "win32"
+comtypes>=1.2; sys_platform == "win32"
+pycaw>=20240316; sys_platform == "win32"
+WMI>=1.5; sys_platform == "win32"
+winshell>=0.6; sys_platform == "win32"
+# Detects when a video actually starts playing (used by "play X ... next video"),
+# powers "what's playing", and does OCR ("what does my screen say", "ocr image X").
+# Falls back to a fixed wait / a clear "install winsdk" message if missing.
+winsdk>=1.0.0b10; sys_platform == "win32"
+
+# Direct text extraction from PDFs and Word docs ("read the pdf X", "read the docx Y"),
+# without opening the app that made them. Optional — JARVIS says so if missing.
+pypdf>=4.0
+python-docx>=1.1

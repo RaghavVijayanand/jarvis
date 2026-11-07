@@ -1,1080 +1,627 @@
-"""
-AI-Powered Screen Automation Skill for JARVIS
-Takes screenshots, analyzes with AI vision, and executes actions
-"""
+"""Screen vision and mouse/keyboard automation.
 
-import os
-import time
+* Screenshots are downscaled before being sent to a vision model, and the
+  model's coordinates are mapped back to real screen coordinates using the
+  measured ratio — correct on high-DPI and multi-resolution setups (UC 6.5).
+* One shared instance per JARVIS; the emergency-stop hotkey is registered once
+  (UC 6.1). Stop with **Ctrl+Alt+Esc** or by slamming the mouse into a corner.
+* Unicode text is pasted, not typed key-by-key (UC 6.3).
+* Confirmation goes through ``JARVIS.confirm`` so it reaches the GUI dialog or
+  the console — never a hidden ``input()`` in a worker thread (UC 6.2).
+* Task completion is judged by an explicit structured answer from the vision
+  model, cross-checked by the local decision model and a screen-change check,
+  not by keyword overlap (UC 6.4).
+"""
+from __future__ import annotations
+
+import ast
 import json
-import base64
-import threading
+import os
 import re
-from typing import Dict, List, Tuple, Optional, Any
+import threading
+import time
+import weakref
 from datetime import datetime
-from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-import pyautogui
-import pynput
-from PIL import Image, ImageDraw
-import requests
+from core.config import Config
+from core.logging_setup import get_logger
+
+log = get_logger("jarvis.screen")
+
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE = 0.15
+except Exception:  # pragma: no cover - headless test machines
+    pyautogui = None
+
+MODEL_IMAGE_WIDTH = 1366
+RISKY_WORDS = re.compile(r"\b(delete|remove|uninstall|erase|format|send|submit|pay|purchase|buy|order|"
+                         r"sign out|log ?out|shut ?down|restart|confirm|transfer|post|publish)\b", re.I)
+
+_hotkey_lock = threading.Lock()
+_hotkey_listener = None
+_stop_callbacks: List[Any] = []   # weak references, so throw-away skill instances don't leak
+
+
+def _fire_emergency_stop() -> None:
+    with _hotkey_lock:
+        refs = list(_stop_callbacks)
+    for ref in refs:
+        cb = ref() if isinstance(ref, (weakref.ref, weakref.WeakMethod)) else ref
+        if cb is None:
+            continue
+        try:
+            cb()
+        except Exception:
+            pass
+
+
+def _install_emergency_stop(callback) -> None:
+    """Register ``callback`` for the global Ctrl+Alt+Esc stop hotkey (listener created once)."""
+    global _hotkey_listener
+    with _hotkey_lock:
+        try:
+            ref = weakref.WeakMethod(callback)
+        except TypeError:          # plain function / lambda
+            ref = callback
+        # drop dead references and avoid registering the same callback twice
+        _stop_callbacks[:] = [r for r in _stop_callbacks
+                              if not (isinstance(r, weakref.WeakMethod) and r() is None)]
+        if not any((r() if isinstance(r, weakref.WeakMethod) else r) == callback for r in _stop_callbacks):
+            _stop_callbacks.append(ref)
+        if _hotkey_listener is not None:
+            return
+        try:
+            from pynput import keyboard
+
+            fire = _fire_emergency_stop
+            _hotkey_listener = keyboard.GlobalHotKeys({"<ctrl>+<alt>+<esc>": fire})
+            _hotkey_listener.daemon = True
+            _hotkey_listener.start()
+        except Exception as exc:
+            log.warning("Emergency-stop hotkey unavailable: %s", exc)
+            _hotkey_listener = False
+
+
+_PY_LITERALS = {"true": "True", "false": "False", "null": "None"}
+
+
+def _loose_literal(cand: str) -> Any:
+    """Fallback for Python-style dicts ({'done': False} / {'done': false})."""
+    fixed = re.sub(r"\b(true|false|null)\b", lambda m: _PY_LITERALS[m.group(1)], cand)
+    for src in (cand, fixed):
+        try:
+            return ast.literal_eval(src)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            continue
+    return None
+
+
+def _brace_span(text: str, start: int) -> Optional[str]:
+    """Balanced {...} starting at ``start``, ignoring braces inside quoted strings."""
+    depth, quote, escape = 0, None, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def extract_json(text: str) -> Optional[Dict[str, Any]]:
+    """Pull the first JSON object out of a model reply.
+
+    Handles ```json fences, prose before/after, braces inside strings, a
+    top-level list (first object wins) and Python-style single-quoted dicts.
+    """
+    if not text:
+        return None
+    if isinstance(text, dict):
+        return text
+    if isinstance(text, list):
+        return next((v for v in text if isinstance(v, dict)), None)
+    if not isinstance(text, str):
+        text = str(text)
+    fenced = re.search(r"```(?:json|JSON)?\s*(.*?)\s*```", text, re.S)
+    sources = ([fenced.group(1)] if fenced else []) + [text]
+    decoder = json.JSONDecoder()
+    for src in sources:
+        for m in re.finditer(r"[\[{]", src):
+            try:
+                value, _ = decoder.raw_decode(src, m.start())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, list):
+                first = next((v for v in value if isinstance(v, dict)), None)
+                if first is not None:
+                    return first
+        for m in re.finditer(r"\{", src):
+            cand = _brace_span(src, m.start())
+            value = _loose_literal(cand) if cand else None
+            if isinstance(value, dict):
+                return value
+    return None
+
+
+def _truthy(value: Any) -> bool:
+    """Strict boolean for model fields: the string "false" must not count as true."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1", "y")
+    return bool(value)
+
+
+_KEY_ALIASES = {"control": "ctrl", "windows": "win", "window": "win", "cmd": "win", "super": "win",
+                "escape": "esc", "del": "delete", "return": "enter", "pgup": "pageup", "pgdn": "pagedown",
+                "page_up": "pageup", "page_down": "pagedown", "arrowup": "up", "arrowdown": "down",
+                "arrowleft": "left", "arrowright": "right", "spacebar": "space", "option": "alt"}
+_KIND_ALIASES = {"left_click": "click", "leftclick": "click", "tap": "click", "doubleclick": "double_click",
+                 "rightclick": "right_click", "key": "press", "keypress": "press", "type_text": "type",
+                 "write": "type", "sleep": "wait"}
+RISKY_KEYS = {("alt", "f4"), ("ctrl", "w"), ("shift", "delete"), ("ctrl", "shift", "delete")}
+
 
 class ScreenAutomationSkill:
+    _state_lock = threading.Lock()   # guards is_running so two tasks can't drive the mouse at once
+
     def __init__(self, jarvis_instance=None):
-        """Initialize the screen automation system"""
         self.jarvis = jarvis_instance
         self.is_running = False
         self.emergency_stop = False
-        self.automation_history = []
-        self.current_task = None
-        
-        # Configuration (prefer values from Config and environment)
-        try:
-            from config import Config
-            vision_provider = getattr(Config, 'AUTOMATION_VISION_PROVIDER', getattr(Config, 'VISION_PROVIDER', 'openrouter'))
-            vision_model = getattr(Config, 'AUTOMATION_VISION_MODEL', getattr(Config, 'VISION_MODEL', 'qwen/qwen-2.5-vl-7b-instruct'))
-            openrouter_base = getattr(Config, 'OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
-            openrouter_key = os.getenv('OPENROUTER_API_KEY', getattr(Config, 'OPENROUTER_API_KEY', ''))
-        except Exception:
-            vision_provider = 'openrouter'
-            vision_model = 'qwen/qwen-2.5-vl-7b-instruct'
-            openrouter_base = 'https://openrouter.ai/api/v1'
-            openrouter_key = os.getenv('OPENROUTER_API_KEY', '')
+        self.current_task: Optional[str] = None
+        self.automation_history: List[Dict[str, Any]] = []
+        self.screenshot_dir = str(Config.SCREENSHOTS_DIR)
+        os.makedirs(self.screenshot_dir, exist_ok=True)
+        _install_emergency_stop(self.stop_automation)
 
-        # Determine screenshot path from Config
-        try:
-            from config import Config
-            screenshot_path = getattr(Config, 'AUTOMATION_SCREENSHOT_PATH', str((Path(__file__).resolve().parent.parent / 'cache' / 'screenshots').resolve()))
-        except Exception:
-            screenshot_path = str((Path(__file__).resolve().parent.parent / 'cache' / 'screenshots').resolve())
+    # ── Plumbing ─────────────────────────────────────────────────────────────
 
-        self.config = {
-            'screenshot_path': screenshot_path,
-            'max_retries': 3,
-            'action_delay': 1.0,
-            'confirmation_required': True,
-            'safe_mode': True,
-            'vision_provider': vision_provider,
-            'vision_model': vision_model,
-            'openrouter_api_key': openrouter_key,
-            'openrouter_base_url': openrouter_base,
-            'confidence_threshold': 0.7,
-            'disable_coordinate_adjustment': False  # Set to True to use raw AI coordinates
-        }
-        
-        # Ensure screenshot directory exists
-        os.makedirs(self.config['screenshot_path'], exist_ok=True)
-        
-        # Setup PyAutoGUI safety features
-        pyautogui.FAILSAFE = True
-        pyautogui.PAUSE = 0.5
-        
-        # Emergency stop listener
-        self.setup_emergency_stop()
-        
-        # Action whitelist for safe mode
-        self.safe_actions = {
-            'click', 'scroll', 'type_text', 'read_text', 
-            'take_screenshot', 'move_mouse', 'press_key'
-        }
-        
-        # Dangerous actions that require confirmation
-        self.dangerous_actions = {
-            'delete_file', 'system_shutdown', 'install_software',
-            'modify_registry', 'admin_command'
-        }
-        
-    def setup_emergency_stop(self):
-        """Setup emergency stop hotkey (Ctrl+Shift+ESC)"""
-        def on_hotkey():
-            self.emergency_stop = True
-            self.is_running = False
-            print("🛑 EMERGENCY STOP ACTIVATED!")
-            
-        try:
-            self.hotkey_listener = pynput.keyboard.GlobalHotKeys({
-                '<ctrl>+<shift>+<esc>': on_hotkey
-            })
-            self.hotkey_listener.start()
-        except Exception as e:
-            print(f"Warning: Could not setup emergency stop hotkey: {e}")
-    
+    @property
+    def brain(self):
+        return getattr(self.jarvis, "brain", None)
+
+    def _confirm(self, question: str) -> bool:
+        confirm = getattr(self.jarvis, "confirm", None)
+        if callable(confirm):
+            return bool(confirm(question))
+        return False  # no way to ask → never act on something risky
+
+    def _log(self, entry: Dict[str, Any]) -> None:
+        entry["time"] = datetime.now().strftime("%H:%M:%S")
+        self.automation_history.append(entry)
+        del self.automation_history[:-200]
+
+    def _require_gui(self):
+        if pyautogui is None:
+            raise RuntimeError("Screen control needs pyautogui on a desktop session.")
+
+    # ── Screenshots & vision ─────────────────────────────────────────────────
+
     def take_screenshot(self, region=None) -> str:
-        """Take a screenshot and save it"""
+        self._require_gui()
+        path = os.path.join(self.screenshot_dir, f"screenshot_{datetime.now():%Y%m%d_%H%M%S_%f}.png")
+        image = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
+        image.save(path)
+        self._prune_screenshots()
+        return path
+
+    def _prune_screenshots(self, keep: int = 40) -> None:
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"screenshot_{timestamp}.png"
-            filepath = os.path.join(self.config['screenshot_path'], filename)
-            
-            if region:
-                screenshot = pyautogui.screenshot(region=region)
-            else:
-                screenshot = pyautogui.screenshot()
-                
-            screenshot.save(filepath)
-            return filepath
-            
-        except Exception as e:
-            raise Exception(f"Failed to take screenshot: {str(e)}")
-    
-    def analyze_screenshot(self, image_path: str, user_goal: str) -> Dict[str, Any]:
-        """Send screenshot to AI vision model for analysis"""
+            files = sorted((os.path.join(self.screenshot_dir, f) for f in os.listdir(self.screenshot_dir)
+                            if f.startswith("screenshot_")), key=os.path.getmtime)
+            for old in files[:-keep]:
+                os.remove(old)
+        except OSError:
+            pass
+
+    def _model_image(self, path: str) -> Tuple[str, int, int]:
+        """Downscaled JPEG copy for the model. Returns (path, width, height)."""
+        from PIL import Image
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            if img.width > MODEL_IMAGE_WIDTH:
+                ratio = MODEL_IMAGE_WIDTH / img.width
+                img = img.resize((MODEL_IMAGE_WIDTH, int(img.height * ratio)))
+            out = os.path.splitext(path)[0] + "_model.jpg"
+            img.save(out, "JPEG", quality=80)
+            return out, img.width, img.height
+
+    def _to_screen(self, x: float, y: float, img_w: int, img_h: int) -> Tuple[int, int]:
+        screen_w, screen_h = pyautogui.size()
+        sx = int(round(float(x) * screen_w / img_w))
+        sy = int(round(float(y) * screen_h / img_h))
+        # Stay one pixel inside the edges: an exact corner trips pyautogui's
+        # fail-safe, which would abort the task as if the user had stopped it.
+        return max(1, min(screen_w - 2, sx)), max(1, min(screen_h - 2, sy))
+
+    @staticmethod
+    def _point_from(data: Dict[str, Any], img_w: int, img_h: int) -> Optional[Tuple[float, float]]:
+        """Accept {x,y}, {coordinates:[x,y]} or Gemini-style box_2d (0-1000, ymin,xmin,ymax,xmax)."""
+        if "box_2d" in data and isinstance(data["box_2d"], list) and len(data["box_2d"]) == 4:
+            ymin, xmin, ymax, xmax = [float(v) for v in data["box_2d"]]
+            return (xmin + xmax) / 2 * img_w / 1000, (ymin + ymax) / 2 * img_h / 1000
+        if "x" in data and "y" in data:
+            return float(data["x"]), float(data["y"])
+        coords = data.get("coordinates")
+        if isinstance(coords, list) and len(coords) >= 2:
+            return float(coords[0]), float(coords[1])
+        return None
+
+    def _ask_vision(self, prompt: str, image_path: str) -> str:
+        brain = self.brain
+        if brain is None or not hasattr(brain, "ask_vision"):
+            raise RuntimeError("No AI brain available for screen vision.")
+        return brain.ask_vision(prompt, image_path)
+
+    def describe_screen(self, question: str = "") -> str:
+        """Screenshot + plain-language answer about what is on screen."""
         try:
-            # Read and encode image
-            with open(image_path, 'rb') as image_file:
-                image_data = base64.b64encode(image_file.read()).decode('utf-8')
-            
-            # Get screen dimensions for coordinate calculation
-            import pyautogui
-            screen_width, screen_height = pyautogui.size()
-            
-            # Prepare the enhanced prompt for precise element location
-            prompt = f"""
-            Analyze this screenshot and help achieve the user's goal: "{user_goal}"
-            
-            IMPORTANT: This screenshot is from a {screen_width}x{screen_height} screen.
-            
-            Please provide:
-            1. A description of what you see on the screen
-            2. EXACT pixel coordinates for clickable elements
-            3. Specific actions needed to achieve the goal
-            4. Confidence level (0-1) for your recommendations
-            
-            When identifying clickable elements:
-            - Look for buttons, icons, text fields, menu items
-            - Estimate their CENTER position in pixels from top-left (0,0)
-            - Be as precise as possible with coordinates
-            - Consider element size when calculating center point
-            
-            For coordinate calculation:
-            - Top-left corner is (0, 0)
-            - Bottom-right corner is ({screen_width}, {screen_height})
-            - Click coordinates should be the CENTER of the element
-            
-            Return your response as JSON with this structure:
-            {{
-                "description": "What you see on screen",
-                "screen_info": {{
-                    "resolution": "{screen_width}x{screen_height}",
-                    "elements_found": ["list of clickable elements you can see"]
-                }},
-                "actions": [
-                    {{
-                        "type": "click|type|scroll|wait",
-                        "coordinates": [x, y],
-                        "element_description": "what element you're clicking (e.g., 'Start button', 'File menu')",
-                        "text": "text to type if applicable",
-                        "description": "what this action does",
-                        "confidence": 0.9
-                    }}
-                ],
-                "confidence": 0.8,
-                "risks": ["any potential risks"],
-                "success_indicators": ["how to know if goal achieved"]
-            }}
-            """
-            
-            # Get API response based on provider
-            if self.config['vision_provider'] == 'openrouter':
-                response = self._query_openrouter_vision(prompt, image_path)
-            elif self.config['vision_provider'] == 'openai':
-                response = self._query_openai_vision(prompt, image_data)
-            elif self.config['vision_provider'] == 'anthropic':
-                response = self._query_anthropic_vision(prompt, image_data)
-            elif self.config['vision_provider'] == 'gemini':
-                response = self._query_gemini_vision(prompt, image_path)
-            else:
-                raise Exception("Unsupported vision provider")
-                
-            return response
-            
-        except Exception as e:
-            raise Exception(f"Failed to analyze screenshot: {str(e)}")
-    
-    def _query_openai_vision(self, prompt: str, image_data: str) -> Dict[str, Any]:
-        """Query OpenAI GPT-4 Vision API"""
+            shot = self.take_screenshot()
+            img, _, _ = self._model_image(shot)
+            prompt = (question.strip() or "Describe what is on this screen: the main window, what the user "
+                      "appears to be doing, and anything that needs attention.") + " Be concise."
+            answer = self._ask_vision(prompt, img)
+            self._log({"action": "describe", "result": answer[:200]})
+            return answer
+        except Exception as exc:
+            return f"I couldn't analyze the screen: {exc}"
+
+    def _find_element(self, description: str, shot: str) -> Dict[str, Any]:
+        img, w, h = self._model_image(shot)
+        prompt = (
+            f"This screenshot is {w}x{h} pixels. Find the UI element: \"{description}\".\n"
+            "Reply with JSON only: {\"found\": true|false, \"x\": <center x in pixels>, "
+            "\"y\": <center y in pixels>, \"label\": \"<visible text of the element>\", "
+            "\"confidence\": <0..1>}"
+        )
+        data = extract_json(self._ask_vision(prompt, img)) or {}
+        point = self._point_from(data, w, h) if _truthy(data.get("found", True)) else None
+        if not point:
+            return {"found": False, "label": data.get("label", ""), "confidence": 0.0}
+        sx, sy = self._to_screen(point[0], point[1], w, h)
+        confidence = data.get("confidence")
+        return {"found": True, "coordinates": [sx, sy], "label": data.get("label") or description,
+                # a reported confidence of 0 must stay 0 (``or 0.7`` used to turn it into 0.7)
+                "confidence": 0.7 if confidence in (None, "") else float(confidence)}
+
+    def find_and_click_element(self, element_description: str, button: str = "left",
+                               double: bool = False) -> Dict[str, Any]:
         try:
-            api_key = os.getenv('OPENAI_API_KEY') or os.getenv('OPENROUTER_API_KEY')
-            if not api_key:
-                raise Exception("No OpenAI API key found")
-            
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            # Use OpenRouter if available, otherwise direct OpenAI
-            if os.getenv('OPENROUTER_API_KEY'):
-                url = "https://openrouter.ai/api/v1/chat/completions"
-                model = "openai/gpt-4o"
-            else:
-                url = "https://api.openai.com/v1/chat/completions"
-                model = "gpt-4o"
-            
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{image_data}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 1000
-            }
-            
-            response = requests.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            
-            result = response.json()
-            content = result['choices'][0]['message']['content']
-            
-            # Try to parse as JSON
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                # If not JSON, wrap in basic structure
-                return {
-                    "description": content,
-                    "actions": [],
-                    "confidence": 0.5,
-                    "risks": ["Unable to parse structured response"],
-                    "success_indicators": []
-                }
-                
-        except Exception as e:
-            raise Exception(f"OpenAI Vision API error: {str(e)}")
-    
-    def _query_openrouter_vision(self, prompt: str, image_path: str) -> str:
-        """Query OpenRouter Gemini Vision API"""
+            self._require_gui()
+            shot = self.take_screenshot()
+            info = self._find_element(element_description, shot)
+            if not info["found"]:
+                return {"success": False, "message": f"Could not find '{element_description}' on screen."}
+            if info["confidence"] < Config.AUTOMATION_CONFIDENCE_THRESHOLD:
+                return {"success": False, "confidence": info["confidence"],
+                        "message": f"I'm not confident I found '{element_description}' "
+                                   f"(confidence {info['confidence']:.2f}), so I didn't click."}
+            label = info.get("label") or element_description
+            if RISKY_WORDS.search(f"{element_description} {label}") and not self._confirm(
+                    f"Click '{label}' on screen?"):
+                return {"success": False, "message": f"Not clicking '{label}' — you declined."}
+            x, y = info["coordinates"]
+            pyautogui.click(x, y, clicks=2 if double else 1, button=button)
+            self._log({"action": "click", "target": label, "at": [x, y]})
+            return {"success": True, "coordinates": [x, y], "confidence": info["confidence"],
+                    "message": f"Clicked '{label}' at ({x}, {y})."}
+        except Exception as exc:
+            return {"success": False, "message": f"Click failed: {exc}"}
+
+    # ── Actions ──────────────────────────────────────────────────────────────
+
+    def execute_action(self, action: Dict[str, Any], img_size: Tuple[int, int] = None) -> Tuple[bool, str]:
+        """Run one action dict from the planner. Returns (ok, message)."""
+        self._require_gui()
+        if not getattr(self, "is_running", False):
+            # a direct call (e.g. "press enter"): a stop pressed earlier while idle must not
+            # make every later key press fail with "stopped"; a stop *during* it still works
+            self.emergency_stop = False
+        elif self.emergency_stop:
+            return False, "stopped"
+        if not isinstance(action, dict):
+            return False, "invalid action"
+        kind = re.sub(r"[\s-]+", "_", str(action.get("type", "")).strip().lower())
+        kind = _KIND_ALIASES.get(kind, kind)
+        target = str(action.get("target", "") or action.get("element_description", ""))
+        keys = self._parse_keys(action) if kind in ("press", "hotkey") else []
+        risky = RISKY_WORDS.search(f"{target} {action.get('text', '')}") or tuple(keys) in RISKY_KEYS
+        if risky and not self._confirm(
+                f"Automation wants to {kind} '{target or action.get('text', '') or '+'.join(keys)}'. Allow?"):
+            return False, "declined by user"
         try:
-            import requests
-            import base64
-            import json
-            
-            # Get API key from config
-            api_key = self.config.get('openrouter_api_key') or os.getenv('OPENROUTER_API_KEY', '')
-            if not api_key:
-                raise Exception("No OpenRouter API key found in configuration")
-            
-            # Read and encode the image
-            with open(image_path, "rb") as image_file:
-                image_data = base64.b64encode(image_file.read()).decode('utf-8')
-            
-            # Create the request payload
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://jarvis-local",
-                "X-Title": "JARVIS Visual Automation"
-            }
-            
-            payload = {
-                "model": self.config.get('vision_model', 'qwen/qwen-2.5-vl-7b-instruct'),
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text", 
-                                "text": prompt
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{image_data}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 4000,
-                "temperature": 0.1
-            }
-            
-            # Make the API request
-            response = requests.post(
-                f"{self.config.get('openrouter_base_url', 'https://openrouter.ai/api/v1')}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                raise Exception(f"OpenRouter API error: {response.status_code} {response.text}")
-            
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-            return content
-                
-        except Exception as e:
-            raise Exception(f"OpenRouter Vision API error: {str(e)}")
-    
-    def _query_anthropic_vision(self, prompt: str, image_data: str) -> Dict[str, Any]:
-        """Query Anthropic Claude Vision API"""
-        # Placeholder for Anthropic implementation
-        raise Exception("Anthropic vision not implemented yet")
-    
-    def _query_gemini_vision(self, prompt: str, image_path: str) -> Dict[str, Any]:
-        """Query Gemini Vision directly using Google API"""
-        try:
-            # Try direct Gemini API first
-            gemini_key = 'AIzaSyCiiWZCWLp2bZl60HDHFGuokYifwmnSvfg'
-            if gemini_key:
-                return self._query_gemini_direct(prompt, image_path, gemini_key)
-            else:
-                # Fallback to OpenRouter
-                return self._query_gemini_via_openrouter(prompt, image_path)
-                
-        except Exception as e:
-            print(f"Gemini Vision API error: {str(e)}")
-            return {
-                "success": False,
-                "error": str(e),
-                "message": f"Vision analysis failed: {str(e)}",
-                "elements": [],
-                "recommendations": []
-            }
-    
-    def _query_gemini_direct(self, prompt: str, image_path: str, api_key: str) -> Dict[str, Any]:
-        """Query Gemini Vision API directly"""
-        try:
-            import requests
-            import base64
-            import json
-            
-            # Read and encode the image
-            with open(image_path, "rb") as image_file:
-                image_data = base64.b64encode(image_file.read()).decode('utf-8')
-            
-            # Create the request payload for Gemini API
-            headers = {
-                "Content-Type": "application/json",
-            }
-            
-            # Gemini API endpoint
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-            
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {
-                                "text": prompt
-                            },
-                            {
-                                "inline_data": {
-                                    "mime_type": "image/png",
-                                    "data": image_data
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "generationConfig": {
-                    "maxOutputTokens": 2000,
-                    "temperature": 0.1
-                }
-            }
-            
-            # Make the API request
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            
-            if response.status_code != 200:
-                raise Exception(f"Gemini API error: {response.status_code} {response.text}")
-            
-            result = response.json()
-            
-            # Handle different response structures
-            try:
-                if "candidates" in result and result["candidates"]:
-                    candidate = result["candidates"][0]
-                    if "content" in candidate:
-                        if "parts" in candidate["content"]:
-                            content = candidate["content"]["parts"][0]["text"]
-                        elif "text" in candidate["content"]:
-                            content = candidate["content"]["text"]
-                        else:
-                            content = str(candidate["content"])
-                    elif "text" in candidate:
-                        content = candidate["text"]
-                    else:
-                        content = str(candidate)
+            if kind in ("click", "double_click", "right_click"):
+                if img_size:
+                    point = self._point_from(action, *img_size)
+                    if not point:
+                        return False, "no coordinates"
+                    x, y = self._to_screen(point[0], point[1], *img_size)
                 else:
-                    content = str(result)
-            except (KeyError, IndexError, TypeError) as e:
-                print(f"Debug - API Response structure: {result}")
-                raise Exception(f"Unexpected API response structure: {str(e)}")
-            
-            # Try to parse as JSON
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                # If not JSON, try to extract JSON from the response
-                import re
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    try:
-                        return json.loads(json_match.group())
-                    except json.JSONDecodeError:
-                        pass
-                
-                # If still can't parse, wrap in basic structure
-                return {
-                    "success": True,
-                    "message": content,
-                    "elements": [],
-                    "recommendations": [content]
-                }
-                
-        except Exception as e:
-            raise Exception(f"Direct Gemini API error: {str(e)}")
-    
-    def _query_gemini_via_openrouter(self, prompt: str, image_path: str) -> Dict[str, Any]:
-        """Query Gemini Vision via OpenRouter (fallback)"""
-        try:
-            import requests
-            import base64
-            import json
-            
-            # Configure OpenRouter API from config
-            api_key = self.config.get('openrouter_api_key') or os.getenv('OPENROUTER_API_KEY', '')
-            if not api_key:
-                raise Exception("No OpenRouter API key found in configuration")
-            
-            # Read and encode the image
-            with open(image_path, "rb") as image_file:
-                image_data = base64.b64encode(image_file.read()).decode('utf-8')
-            
-            # Create the request payload
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://jarvis-local",
-                "X-Title": "JARVIS Visual Automation"
-            }
-            
-            # Create the prompt for Gemini via OpenRouter
-            full_prompt = f"""
-            {prompt}
-            
-            Please analyze this screenshot carefully and provide a JSON response with the exact structure requested above.
-            Focus on identifying clickable elements, text fields, and providing precise coordinates for actions.
-            """
-            
-            payload = {
-                "model": self.config.get('vision_model', 'qwen/qwen-2.5-vl-7b-instruct'),
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": full_prompt
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{image_data}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 2000,  # Reduced to save credits
-                "temperature": 0.1
-            }
-            
-            # Make the API request
-            response = requests.post(
-                f"{self.config.get('openrouter_base_url', 'https://openrouter.ai/api/v1')}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                raise Exception(f"OpenRouter API error: {response.status_code} {response.text}")
-            
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-            
-            # Try to parse as JSON
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                # If not JSON, try to extract JSON from the response
-                import re
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    try:
-                        return json.loads(json_match.group())
-                    except json.JSONDecodeError:
-                        pass
-                
-                # If still can't parse, wrap in basic structure
-                return {
-                    "success": True,
-                    "message": content,
-                    "elements": [],
-                    "recommendations": [content]
-                }
-                
-        except Exception as e:
-            raise Exception(f"OpenRouter fallback error: {str(e)}")
-    
-    def _query_anthropic_vision(self, prompt: str, image_data: str) -> Dict[str, Any]:
-        """Query Anthropic Claude Vision API"""
-        # Placeholder for Anthropic implementation
-        raise Exception("Anthropic vision not implemented yet")
-    
-    def execute_action(self, action: Dict[str, Any]) -> bool:
-        """Execute a single action"""
-        try:
+                    # screen coordinates given directly; never default to (0, 0) — that is a
+                    # fail-safe corner and clicking it silently aborts the next action
+                    point = self._point_from(action, 1, 1)
+                    if not point:
+                        return False, "no coordinates"
+                    x, y = int(round(point[0])), int(round(point[1]))
+                if self.emergency_stop:
+                    return False, "stopped"
+                pyautogui.click(x, y, clicks=2 if kind == "double_click" else 1,
+                                button="right" if kind == "right_click" else "left")
+                return True, f"{kind} at ({x},{y}) {target}"
+            if kind == "type":
+                text = str(action.get("text", ""))
+                if text.isascii() and "\n" not in text:
+                    # typed in small chunks so the emergency stop interrupts long text
+                    for i in range(0, len(text), 16):
+                        if self.emergency_stop:
+                            return False, "stopped"
+                        pyautogui.write(text[i:i + 16], interval=0.02)
+                else:
+                    windows = getattr(self.jarvis, "windows", None)
+                    if windows is None or not hasattr(windows, "type_text"):
+                        from skills.windows_control import WindowsControl
+                        windows = WindowsControl()
+                    outcome = windows.type_text(text)
+                    if isinstance(outcome, str) and not outcome.startswith("Typed"):
+                        return False, f"type failed: {outcome}"
+                if action.get("enter") is True or str(action.get("enter")).lower() == "true":
+                    if self.emergency_stop:
+                        return False, "stopped"
+                    pyautogui.press("enter")
+                return True, f"typed {len(text)} chars"
+            if kind in ("press", "hotkey"):
+                if not keys:
+                    return False, "no key"
+                valid = getattr(pyautogui, "KEYBOARD_KEYS", None)
+                if isinstance(valid, (list, tuple, set, frozenset)):
+                    unknown = [k for k in keys if k not in valid]
+                    if unknown:     # pyautogui silently ignores unknown key names
+                        return False, "unknown key " + ", ".join(unknown)
+                pyautogui.hotkey(*keys) if len(keys) > 1 else pyautogui.press(keys[0])
+                return True, "pressed " + "+".join(keys)
+            if kind == "scroll":
+                amount = abs(int(float(action.get("amount", 5))))
+                pyautogui.scroll(amount * (120 if os.name == "nt" else 1) *
+                                 (-1 if str(action.get("direction", "down")).lower() == "down" else 1))
+                return True, f"scrolled {action.get('direction', 'down')}"
+            if kind == "wait":
+                if not self._sleep(min(10.0, max(0.0, float(action.get("seconds", 1))))):
+                    return False, "stopped"
+                return True, "waited"
+            if kind == "open":
+                app = getattr(self.jarvis, "app_control", None)
+                if app is None:
+                    return False, "app control unavailable"
+                return True, app.launch_app_by_name(str(action.get("target", "")))
+            return False, f"unknown action '{kind}'"
+        except pyautogui.FailSafeException:
+            self.stop_automation()
+            return False, "fail-safe triggered (mouse in corner)"
+        except Exception as exc:
+            return False, f"{kind} failed: {exc}"
+
+    @staticmethod
+    def _parse_keys(action: Dict[str, Any]) -> List[str]:
+        keys = action.get("keys") or action.get("key") or ""
+        keys = keys if isinstance(keys, list) else re.split(r"\s*\+\s*", str(keys))
+        keys = [str(k).strip().lower() for k in keys if str(k).strip()]
+        return [_KEY_ALIASES.get(k, k) for k in keys]
+
+    def _sleep(self, seconds: float) -> bool:
+        """Interruptible sleep: returns False as soon as the emergency stop fires."""
+        end = time.monotonic() + max(0.0, float(seconds or 0))
+        while True:
             if self.emergency_stop:
                 return False
-                
-            action_type = action.get('type', '').lower()
-            
-            # Safety checks
-            if self.config['safe_mode'] and action_type not in self.safe_actions:
-                if self.config['confirmation_required']:
-                    if not self._confirm_action(action):
-                        return False
-            
-            # Add to history
-            self.automation_history.append({
-                'timestamp': datetime.now().isoformat(),
-                'action': action,
-                'status': 'executing'
-            })
-            
-            # Execute based on type
-            success = False
-            if action_type == 'click':
-                success = self._execute_click(action)
-            elif action_type == 'type':
-                success = self._execute_type(action)
-            elif action_type == 'scroll':
-                success = self._execute_scroll(action)
-            elif action_type == 'wait':
-                success = self._execute_wait(action)
-            elif action_type == 'press_key':
-                success = self._execute_key_press(action)
-            else:
-                print(f"Unknown action type: {action_type}")
-                return False
-            
-            # Update history
-            self.automation_history[-1]['status'] = 'success' if success else 'failed'
-            
-            # Add delay between actions
-            time.sleep(self.config['action_delay'])
-            
-            return success
-            
-        except Exception as e:
-            print(f"Error executing action: {str(e)}")
-            if self.automation_history:
-                self.automation_history[-1]['status'] = 'error'
-                self.automation_history[-1]['error'] = str(e)
-            return False
-    
-    def _execute_click(self, action: Dict[str, Any]) -> bool:
-        """Execute mouse click"""
-        try:
-            coords = action.get('coordinates', [0, 0])
-            
-            # Validate coordinates
-            coords = self._validate_coordinates(coords)
-            
-            button = action.get('button', 'left')
-            clicks = action.get('clicks', 1)
-            
-            print(f"Clicking at validated coordinates: {coords}")
-            pyautogui.click(coords[0], coords[1], clicks=clicks, button=button)
-            return True
-        except Exception as e:
-            print(f"Click failed: {str(e)}")
-            return False
-    
-    def _execute_type(self, action: Dict[str, Any]) -> bool:
-        """Execute text typing"""
-        try:
-            text = action.get('text', '')
-            interval = action.get('interval', 0.1)
-            
-            pyautogui.typewrite(text, interval=interval)
-            return True
-        except Exception as e:
-            print(f"Type failed: {str(e)}")
-            return False
-    
-    def _execute_scroll(self, action: Dict[str, Any]) -> bool:
-        """Execute scroll action"""
-        try:
-            clicks = action.get('clicks', 3)
-            direction = action.get('direction', 'up')
-            x = action.get('x', pyautogui.size()[0] // 2)
-            y = action.get('y', pyautogui.size()[1] // 2)
-            
-            if direction == 'down':
-                clicks = -clicks
-                
-            pyautogui.scroll(clicks, x=x, y=y)
-            return True
-        except Exception as e:
-            print(f"Scroll failed: {str(e)}")
-            return False
-    
-    def _execute_wait(self, action: Dict[str, Any]) -> bool:
-        """Execute wait/delay"""
-        try:
-            duration = action.get('duration', 1.0)
-            time.sleep(duration)
-            return True
-        except Exception as e:
-            print(f"Wait failed: {str(e)}")
-            return False
-    
-    def _execute_key_press(self, action: Dict[str, Any]) -> bool:
-        """Execute key press"""
-        try:
-            key = action.get('key', '')
-            modifier = action.get('modifier', None)
-            
-            if modifier:
-                pyautogui.hotkey(modifier, key)
-            else:
-                pyautogui.press(key)
-            return True
-        except Exception as e:
-            print(f"Key press failed: {str(e)}")
-            return False
-    
-    def _confirm_action(self, action: Dict[str, Any]) -> bool:
-        """Ask user to confirm dangerous action"""
-        try:
-            if self.jarvis and hasattr(self.jarvis, 'gui'):
-                # Use GUI confirmation if available
-                from PySide6.QtWidgets import QMessageBox
-                
-                msg = QMessageBox()
-                msg.setWindowTitle("Confirm Automation Action")
-                msg.setText(f"Action: {action.get('type', 'Unknown')}\n"
-                           f"Description: {action.get('description', 'No description')}\n"
-                           f"Coordinates: {action.get('coordinates', 'N/A')}\n\n"
-                           f"Do you want to proceed?")
-                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-                msg.setDefaultButton(QMessageBox.No)
-                
-                return msg.exec() == QMessageBox.Yes
-            else:
-                # Console confirmation
-                response = input(f"Confirm action: {action.get('description', 'Unknown action')} (y/N): ")
-                return response.lower() in ['y', 'yes']
-                
-        except Exception as e:
-            print(f"Confirmation failed: {str(e)}")
-            return False
-    
-    def automate_task(self, goal: str, max_steps: int = 10) -> Dict[str, Any]:
-        """Main automation function"""
-        try:
-            self.is_running = True
-            self.emergency_stop = False
-            self.current_task = goal
-            
-            results = {
-                'goal': goal,
-                'status': 'running',
-                'steps_completed': 0,
-                'total_steps': 0,
-                'actions_taken': [],
-                'screenshots': [],
-                'errors': []
-            }
-            
-            for step in range(max_steps):
-                if self.emergency_stop or not self.is_running:
-                    results['status'] = 'stopped'
-                    break
-                
-                try:
-                    # Take screenshot
-                    screenshot_path = self.take_screenshot()
-                    results['screenshots'].append(screenshot_path)
-                    
-                    # Analyze with AI
-                    analysis = self.analyze_screenshot(screenshot_path, goal)
-                    
-                    if analysis['confidence'] < self.config['confidence_threshold']:
-                        results['errors'].append(f"Low confidence in step {step + 1}: {analysis['confidence']}")
-                        
-                    # Check if goal achieved
-                    if self._check_goal_achieved(analysis, goal):
-                        results['status'] = 'completed'
-                        break
-                    
-                    # Execute actions
-                    actions_executed = 0
-                    for action in analysis.get('actions', []):
-                        if self.emergency_stop:
-                            break
-                            
-                        success = self.execute_action(action)
-                        results['actions_taken'].append({
-                            'action': action,
-                            'success': success,
-                            'step': step + 1
-                        })
-                        
-                        if success:
-                            actions_executed += 1
-                    
-                    results['steps_completed'] = step + 1
-                    
-                    # If no actions taken, we might be stuck
-                    if actions_executed == 0:
-                        results['errors'].append(f"No actions executed in step {step + 1}")
-                        break
-                        
-                except Exception as e:
-                    error_msg = f"Error in step {step + 1}: {str(e)}"
-                    results['errors'].append(error_msg)
-                    print(error_msg)
-                    break
-            
-            # Final status
-            if results['status'] == 'running':
-                results['status'] = 'incomplete' if results['errors'] else 'max_steps_reached'
-            
-            results['total_steps'] = results['steps_completed']
-            self.is_running = False
-            self.current_task = None
-            
-            return results
-            
-        except Exception as e:
-            self.is_running = False
-            self.current_task = None
-            return {
-                'goal': goal,
-                'status': 'error',
-                'error': str(e),
-                'steps_completed': 0,
-                'total_steps': 0,
-                'actions_taken': [],
-                'screenshots': [],
-                'errors': [str(e)]
-            }
-    
-    def _check_goal_achieved(self, analysis: Dict[str, Any], goal: str) -> bool:
-        """Check if the goal has been achieved"""
-        # This is a simple implementation - could be enhanced with more sophisticated checks
-        success_indicators = analysis.get('success_indicators', [])
-        description = analysis.get('description', '').lower()
-        goal_lower = goal.lower()
-        
-        # Look for success keywords in description
-        success_keywords = ['completed', 'finished', 'done', 'success', 'opened', 'loaded']
-        goal_keywords = goal_lower.split()
-        
-        # Check if any success indicators match
-        for indicator in success_indicators:
-            if any(keyword in indicator.lower() for keyword in goal_keywords):
+            left = end - time.monotonic()
+            if left <= 0:
                 return True
-        
-        # Check description for success
-        if any(keyword in description for keyword in success_keywords):
-            if any(keyword in description for keyword in goal_keywords):
-                return True
-        
-        return False
-    
-    def _adjust_coordinates_for_accuracy(self, coordinates: list, element_info: dict) -> list:
-        """Adjust coordinates for better clicking accuracy"""
-        try:
-            x, y = coordinates[0], coordinates[1]
-            element_name = element_info.get('element_name', '').lower()
-            element_size = element_info.get('element_size', [0, 0])
-            text_bounds = element_info.get('text_bounds', {})
-            
-            print(f"Raw coordinates from AI: ({x}, {y})")
-            print(f"Element: {element_name}")
-            print(f"Text bounds: {text_bounds}")
-            
-            # For menu items, use more conservative X-axis adjustment
-            if any(menu_word in element_name for menu_word in ['file', 'edit', 'view', 'help', 'terminal', 'run']):
-                # If we have text bounds, use them but validate they make sense
-                if text_bounds and all(key in text_bounds for key in ['left', 'right', 'top', 'bottom']):
-                    # Calculate center from bounds
-                    bounds_center_x = (text_bounds['left'] + text_bounds['right']) // 2
-                    bounds_center_y = (text_bounds['top'] + text_bounds['bottom']) // 2
-                    
-                    # Check if bounds seem reasonable (not too far from original)
-                    x_diff = abs(bounds_center_x - x)
-                    if x_diff < 100:  # If bounds are reasonable, use them
-                        print(f"Using text bounds center: ({bounds_center_x}, {bounds_center_y})")
-                        return [bounds_center_x, bounds_center_y]
-                    else:
-                        print(f"Text bounds seem off (x_diff: {x_diff}), using minimal adjustment")
-                
-                # Apply minimal X-axis adjustment for menu items
-                # Keep Y as-is since it's correct, adjust X slightly towards center
-                text_length = len(element_name)
-                # Very conservative adjustment - just move a few pixels right
-                adjusted_x = x + max(5, text_length)  # Small rightward adjustment
-                print(f"Conservative menu adjustment: ({x}, {y}) -> ({adjusted_x}, {y})")
-                return [adjusted_x, y]
-            
-            # For other elements, keep original coordinates
-            print(f"Using original coordinates for non-menu element: ({x}, {y})")
-            return coordinates
-            
-        except Exception as e:
-            print(f"Coordinate adjustment failed: {e}")
-            return coordinates
-    
-    def _validate_coordinates(self, coordinates: list) -> list:
-        """Validate and adjust coordinates to be within screen bounds"""
-        try:
-            import pyautogui
-            screen_width, screen_height = pyautogui.size()
-            
-            x, y = coordinates[0], coordinates[1]
-            
-            # Ensure coordinates are within screen bounds
-            x = max(0, min(x, screen_width - 1))
-            y = max(0, min(y, screen_height - 1))
-            
-            return [int(x), int(y)]
-            
-        except Exception as e:
-            print(f"Coordinate validation failed: {e}")
-            return coordinates
-    
-    def _find_element_on_screen(self, element_description: str, screenshot_path: str) -> dict:
-        """Enhanced element detection using AI vision"""
-        try:
-            import pyautogui
-            screen_width, screen_height = pyautogui.size()
-            
-            # Enhanced prompt for precise element location
-            prompt = f"""
-            In this {screen_width}x{screen_height} screenshot, locate the "{element_description}" with EXTREME PRECISION.
-            
-            CRITICAL X-AXIS ACCURACY REQUIREMENTS:
-            1. Find the EXACT horizontal center of the text/element
-            2. For menu items, measure the text width carefully and find the true center
-            3. Do NOT guess - count pixels if needed for X-coordinate precision
-            4. The X coordinate must be the EXACT middle of the visible text
-            5. Y coordinate should be the vertical center of the text
-            
-            MEASUREMENT PROCESS:
-            1. Identify the leftmost pixel of the text
-            2. Identify the rightmost pixel of the text  
-            3. Calculate: center_x = (left + right) / 2
-            4. Verify this is the true center
-            
-            Look for:
-            - Buttons, icons, menu items, text fields matching this description
-            - Consider partial matches (e.g., "calc" could match "Calculator")
-            
-            Return JSON with PRECISE measurements:
-            {{
-                "found": true/false,
-                "element_name": "actual name of element found",
-                "coordinates": [precise_center_x, precise_center_y],
-                "element_size": [width, height],
-                "confidence": 0.9,
-                "text_bounds": {{"left": exact_left_x, "top": exact_top_y, "right": exact_right_x, "bottom": exact_bottom_y}},
-                "measurement_notes": "description of how coordinates were measured",
-                "alternatives": [
-                    {{"name": "alternative element", "coordinates": [x, y]}}
-                ]
-            }}
-            """
-            
-            # Get response from vision API
-            if self.config['vision_provider'] == 'openrouter':
-                response = self._query_openrouter_vision(prompt, screenshot_path)
-            elif self.config['vision_provider'] == 'gemini':
-                response = self._query_gemini_vision(prompt, screenshot_path)
-            else:
-                # Read and encode image for OpenAI
-                with open(screenshot_path, 'rb') as image_file:
-                    image_data = base64.b64encode(image_file.read()).decode('utf-8')
-                response = self._query_openai_vision(prompt, image_data)
-                
-            return response
-            
-        except Exception as e:
-            return {
-                "found": False,
-                "error": str(e),
-                "coordinates": [0, 0],
-                "confidence": 0.0
-            }
-    
-    def stop_automation(self):
-        """Stop current automation"""
-        self.emergency_stop = True
-        self.is_running = False
-        self.current_task = None
-    
-    def get_status(self) -> Dict[str, Any]:
-        """Get current automation status"""
-        return {
-            'is_running': self.is_running,
-            'current_task': self.current_task,
-            'emergency_stop': self.emergency_stop,
-            'history_count': len(self.automation_history),
-            'config': self.config
-        }
-    
-    def get_history(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get recent automation history"""
-        return self.automation_history[-limit:] if self.automation_history else []
-    
-    def clear_history(self):
-        """Clear automation history"""
-        self.automation_history.clear()
-    
-    def cleanup(self):
-        """Cleanup resources"""
-        self.stop_automation()
-        if hasattr(self, 'hotkey_listener'):
-            self.hotkey_listener.stop()
-    
-    def find_and_click_element(self, element_description: str) -> Dict[str, Any]:
-        """Find a specific element on screen and click it"""
-        try:
-            # Take screenshot first
-            screenshot_path = self.take_screenshot()
-            
-            # Find the element
-            element_info = self._find_element_on_screen(element_description, screenshot_path)
-            
-            if not element_info.get('found', False):
-                return {
-                    'success': False,
-                    'message': f"Could not find element: {element_description}",
-                    'alternatives': element_info.get('alternatives', [])
-                }
-            
-            # Adjust coordinates for better accuracy (if enabled)
-            raw_coordinates = element_info['coordinates']
-            
-            if self.config.get('disable_coordinate_adjustment', False):
-                print(f"Using raw AI coordinates (adjustment disabled): {raw_coordinates}")
-                validated_coordinates = self._validate_coordinates(raw_coordinates)
-            else:
-                adjusted_coordinates = self._adjust_coordinates_for_accuracy(raw_coordinates, element_info)
-                validated_coordinates = self._validate_coordinates(adjusted_coordinates)
-            
-            # Execute click on found element
-            click_action = {
-                'type': 'click',
-                'coordinates': validated_coordinates,
-                'element_description': element_info.get('element_name', element_description),
-                'confidence': element_info.get('confidence', 0.0)
-            }
-            
-            success = self.execute_action(click_action)
-            
-            return {
-                'success': success,
-                'message': f"{'Successfully clicked' if success else 'Failed to click'} {element_info.get('element_name', element_description)}",
-                'coordinates': validated_coordinates,
-                'confidence': element_info.get('confidence', 0.0)
-            }
-            
-        except Exception as e:
-            return {
-                'success': False,
-                'message': f"Error finding/clicking element: {str(e)}",
-                'error': str(e)
-            }
+            time.sleep(min(0.05, left))
 
-# Integration with JARVIS command processing
+    @staticmethod
+    def _screen_changed(a: str, b: str) -> bool:
+        try:
+            from PIL import Image, ImageChops
+            with Image.open(a) as ia, Image.open(b) as ib:
+                if ia.size != ib.size:
+                    return True
+                diff = ImageChops.difference(ia.convert("L").resize((320, 180)),
+                                             ib.convert("L").resize((320, 180)))
+                return sum(1 for px in diff.getdata() if px > 24) > 150
+        except Exception:
+            return True
+
+    def _goal_check(self, goal: str, reason: str) -> Optional[float]:
+        decider = getattr(self.jarvis, "decision", None)
+        if decider is None or not getattr(decider, "laya_ready", False):
+            return None
+        return decider.yes_no({"goal": goal, "screen_report": reason},
+                              "Does the screen report say the goal has been fully completed?")
+
+    def automate_task(self, goal: str, max_steps: int = None) -> Dict[str, Any]:
+        """Observe → decide one action → act → verify, until done or stopped."""
+        max_steps = max_steps or Config.AUTOMATION_MAX_STEPS
+        result = {"goal": goal, "status": "running", "steps_completed": 0, "actions_taken": [],
+                  "errors": [], "summary": ""}
+        try:
+            self._require_gui()
+        except RuntimeError as exc:
+            result.update(status="error", summary=str(exc))
+            return result
+        if Config.AUTOMATION_CONFIRMATION_REQUIRED and not self._confirm(
+                f"Let JARVIS control your mouse and keyboard to: {goal}?\n"
+                f"Press Ctrl+Alt+Esc or move the mouse to a screen corner to stop."):
+            result.update(status="cancelled", summary="You declined, so I didn't touch anything.")
+            return result
+        with self._state_lock:
+            if self.is_running:
+                result.update(status="error", summary="Another screen automation is already running.")
+                return result
+            self.is_running, self.emergency_stop, self.current_task = True, False, goal
+        history: List[str] = []
+        stuck = bad_replies = 0
+        previous_shot = None      # screenshot taken just before the last executed action
+        try:
+            for step in range(1, max_steps + 1):
+                if self.emergency_stop:
+                    result["status"] = "stopped"
+                    break
+                shot = self.take_screenshot()
+                if previous_shot is not None:
+                    stuck = 0 if self._screen_changed(previous_shot, shot) else stuck + 1
+                    if stuck >= 2:
+                        result["status"] = "stuck"
+                        result["errors"].append("The screen stopped changing after my actions.")
+                        break
+                    previous_shot = None
+                img, w, h = self._model_image(shot)
+                prompt = (
+                    f"You control a Windows PC to achieve this goal: \"{goal}\".\n"
+                    f"The screenshot is {w}x{h} pixels. Actions so far: {history[-6:] or 'none'}.\n"
+                    "Decide the SINGLE next action. Reply with JSON only:\n"
+                    "{\"done\": true|false, \"reason\": \"what the screen shows / why\", "
+                    "\"action\": {\"type\": \"click|double_click|right_click|type|press|scroll|wait|open\", "
+                    "\"x\": <px>, \"y\": <px>, \"target\": \"element or app name\", \"text\": \"to type\", "
+                    "\"enter\": false, \"keys\": \"ctrl+s\", \"direction\": \"down\", \"amount\": 5}}\n"
+                    "Set done=true (and omit action) only when the goal is visibly complete."
+                )
+                try:
+                    plan = extract_json(self._ask_vision(prompt, img))
+                except Exception as exc:
+                    result["errors"].append(f"Vision model error: {exc}")
+                    result["status"] = "error"
+                    break
+                action = plan.get("action") if plan else None
+                if isinstance(action, dict) and str(action.get("type", "")).strip().lower() == "done":
+                    plan["done"], action = True, None
+                if self.emergency_stop:
+                    result["status"] = "stopped"
+                    break
+                if not plan or not (_truthy(plan.get("done")) or (isinstance(action, dict) and action)):
+                    result["errors"].append(f"Step {step}: the model's reply wasn't a valid JSON action.")
+                    bad_replies += 1
+                    if bad_replies >= 2:
+                        result["status"] = "error"
+                        break
+                    continue
+                bad_replies = 0          # the limit is for consecutive unusable replies
+                reason = str(plan.get("reason", ""))
+                if _truthy(plan.get("done")):
+                    check = self._goal_check(goal, reason)
+                    if check is None or check >= 0.5:
+                        result["status"] = "completed"
+                        result["summary"] = reason
+                        break
+                    history.append(f"model said done but verification disagreed ({reason[:60]})")
+                    continue
+                # a "wait" legitimately leaves the screen unchanged, so it must not count as stuck
+                previous_shot = None if str(action.get("type", "")).strip().lower() == "wait" else shot
+                ok, msg = self.execute_action(action, (w, h))
+                history.append(f"{action.get('type')} {action.get('target', '')}: {msg}")
+                result["actions_taken"].append({"step": step, "action": action, "success": ok, "message": msg})
+                self._log({"action": action.get("type"), "target": action.get("target"), "ok": ok, "goal": goal})
+                result["steps_completed"] = step
+                if not ok:
+                    result["errors"].append(f"Step {step}: {msg}")
+                    if msg in ("declined by user", "stopped") or msg.startswith("fail-safe"):
+                        result["status"] = "stopped"
+                        break
+                if not self._sleep(Config.AUTOMATION_ACTION_DELAY):
+                    result["status"] = "stopped"
+                    break
+            if result["status"] == "running":
+                result["status"] = "stopped" if self.emergency_stop else "incomplete"
+        except Exception as exc:     # screenshot / image errors must not escape with is_running stuck
+            log.exception("Screen automation failed")
+            result["status"] = "error"
+            result["errors"].append(f"Automation error: {exc}")
+        finally:
+            self.is_running, self.current_task = False, None
+        return result
+
+    @staticmethod
+    def format_result(result: Dict[str, Any]) -> str:
+        status = result.get("status")
+        head = {"completed": "Done", "cancelled": "Cancelled", "stopped": "Stopped",
+                "stuck": "I got stuck", "error": "Automation failed",
+                "incomplete": "I ran out of steps"}.get(status, status)
+        lines = [f"{head}: {result.get('goal')}", f"Actions taken: {len(result.get('actions_taken', []))}"]
+        if result.get("summary"):
+            lines.append(result["summary"])
+        for err in result.get("errors", [])[:3]:
+            lines.append(f"• {err}")
+        return "\n".join(lines)
+
+    # ── Status ───────────────────────────────────────────────────────────────
+
+    def stop_automation(self):
+        """Safe to call from any thread (GUI, hotkey listener). The running loop sees the
+        flag at its next check and clears ``is_running`` itself when it has really stopped —
+        clearing it here let a second task start (and reset the stop flag) while the first
+        was still driving the mouse."""
+        self.emergency_stop = True
+
+    def get_status(self) -> Dict[str, Any]:
+        return {"is_running": self.is_running, "current_task": self.current_task,
+                "emergency_stop": self.emergency_stop, "history_count": len(self.automation_history)}
+
+    def get_history(self, limit: int = 10) -> List[Dict[str, Any]]:
+        return self.automation_history[-limit:]
+
+    def clear_history(self):
+        self.automation_history.clear()
+
+    def cleanup(self):
+        self.stop_automation()
+
+
 def process_automation_command(command: str, jarvis_instance=None) -> str:
-    """Process automation-related commands"""
-    automation = ScreenAutomationSkill(jarvis_instance)
-    
-    command_lower = command.lower()
-    
-    if command_lower.startswith('automate'):
-        goal = command[8:].strip()  # Remove 'automate' prefix
-        if not goal:
-            return "Please specify what you want to automate. Example: 'automate open calculator'"
-        
-        try:
-            result = automation.automate_task(goal)
-            
-            status_msg = f"Automation {result['status']}\n"
-            status_msg += f"Goal: {result['goal']}\n"
-            status_msg += f"Steps completed: {result['steps_completed']}\n"
-            status_msg += f"Actions taken: {len(result['actions_taken'])}\n"
-            
-            if result['errors']:
-                status_msg += f"Errors: {len(result['errors'])}\n"
-                for error in result['errors'][:3]:  # Show first 3 errors
-                    status_msg += f"  - {error}\n"
-            
-            return status_msg
-            
-        except Exception as e:
-            return f"Automation failed: {str(e)}"
-    
-    elif command_lower.startswith('click on') or command_lower.startswith('find and click'):
-        # Extract element description
-        if command_lower.startswith('click on'):
-            element = command[8:].strip()  # Remove 'click on' prefix
-        else:
-            element = command[13:].strip()  # Remove 'find and click' prefix
-            
-        if not element:
-            return "Please specify what to click. Example: 'click on start button'"
-        
-        try:
-            result = automation.find_and_click_element(element)
-            
-            if result['success']:
-                return f"✅ {result['message']} (confidence: {result.get('confidence', 0):.1f})"
-            else:
-                msg = f"❌ {result['message']}"
-                if result.get('alternatives'):
-                    msg += f"\nAlternatives found: {', '.join([alt['name'] for alt in result['alternatives'][:3]])}"
-                return msg
-                
-        except Exception as e:
-            return f"Click operation failed: {str(e)}"
-    
-    elif 'stop automation' in command_lower:
+    """Text front-end used by JARVIS for screen commands."""
+    automation = getattr(jarvis_instance, "screen_automation", None) or ScreenAutomationSkill(jarvis_instance)
+    text = (command or "").strip()
+    low = text.lower()
+    if re.search(r"\bstop automation\b|\babort\b", low):
         automation.stop_automation()
-        return "Automation stopped"
-    
-    elif 'automation status' in command_lower:
-        status = automation.get_status()
-        return f"Running: {status['is_running']}, Task: {status['current_task'] or 'None'}"
-    
-    elif 'automation history' in command_lower:
-        history = automation.get_history(5)
-        if not history:
-            return "No automation history"
-        
-        history_msg = "Recent automation history:\n"
-        for i, entry in enumerate(history, 1):
-            history_msg += f"{i}. {entry['action'].get('description', 'Unknown')} - {entry['status']}\n"
-        
-        return history_msg
-    
-    else:
-        return "Unknown automation command. Try: 'automate [task]', 'stop automation', 'automation status', or 'automation history'"
+        return "Automation stopped."
+    if "automation status" in low:
+        st = automation.get_status()
+        return f"Running: {st['is_running']}. Task: {st['current_task'] or 'none'}."
+    if "automation history" in low:
+        hist = automation.get_history(8)
+        return "No automation history." if not hist else "\n".join(
+            f"{h['time']} {h.get('action')} {h.get('target') or ''}" for h in hist)
+    m = re.match(r"^(?:please\s+)?(double[- ]?click|right[- ]?click|click|tap|press on)\s+(?:on\s+)?(?:the\s+)?(.+)$", low)
+    if m and not re.search(r"\b(then|and then)\b", low):
+        kind = m.group(1).replace("-", "").replace(" ", "")
+        res = automation.find_and_click_element(m.group(2).strip(), button="right" if kind == "rightclick" else "left",
+                                                double=kind == "doubleclick")
+        return res["message"]
+    if re.search(r"screen ?shot|capture (?:the |my )?screen", low) and not re.search(
+            r"\b(describe|analy[sz]e|tell me|what)\b", low):
+        try:
+            return f"Screenshot saved to {automation.take_screenshot()}"
+        except Exception as exc:
+            return f"Screenshot failed: {exc}"
+    if re.search(r"what(?:'s|s| is) on (?:my |the )?screen|describe|analy[sz]e|look at (?:my |the )?screen|"
+                 r"read (?:my |the )?screen|tell me what you see", low):
+        question = re.sub(r"^(?:take a screenshot and\s+)?", "", text, flags=re.I)
+        return automation.describe_screen(question)
+    goal = re.sub(r"^(?:please\s+)?(?:automate|ai help with|do this on screen:?)\s*", "", text, flags=re.I)
+    if not goal:
+        return "Tell me what to do on screen, e.g. 'automate open Notepad and type hello'."
+    return ScreenAutomationSkill.format_result(automation.automate_task(goal))

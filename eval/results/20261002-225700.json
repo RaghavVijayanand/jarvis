@@ -1,0 +1,316 @@
+{
+ "model": "ollama:qwen3:4b-instruct",
+ "laya": false,
+ "results": [
+  {
+   "category": "follow-up",
+   "said": "open notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.02,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ]
+   ],
+   "reply": "Opened Notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "actually close that",
+   "passed": false,
+   "problems": [
+    "missing close(notepad)"
+   ],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [],
+   "reply": "Close notepad? Unsaved work in it may be lost. Reply yes to confirm, or no to cancel."
+  },
+  {
+   "category": "follow-up",
+   "said": "open spotify",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "spotify"
+    ]
+   ],
+   "reply": "Opened Spotify."
+  },
+  {
+   "category": "follow-up",
+   "said": "close it",
+   "passed": false,
+   "problems": [
+    "missing close(spotify)"
+   ],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [],
+   "reply": "Close spotify? Unsaved work in it may be lost. Reply yes to confirm, or no to cancel."
+  },
+  {
+   "category": "follow-up",
+   "said": "open notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ]
+   ],
+   "reply": "Opened Notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "write a haiku about coffee and put it there",
+   "passed": true,
+   "problems": [],
+   "seconds": 3.09,
+   "path": "ai",
+   "actions": [
+    [
+     "focus",
+     "Notepad"
+    ],
+    [
+     "type",
+     "Notepad: Brewed in morning light,  \nSteam curls like whispered dreams\u2014  \nOne sip, and the world wakes."
+    ]
+   ],
+   "reply": "Done \u2014 wrote 15 words and typed them into Notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "now close it",
+   "passed": false,
+   "problems": [
+    "missing close(notepad)"
+   ],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [],
+   "reply": "Close notepad? Unsaved work in it may be lost. Reply yes to confirm, or no to cancel."
+  },
+  {
+   "category": "follow-up",
+   "said": "play some lofi on youtube",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "play some lofi on youtube"
+    ]
+   ],
+   "reply": "Opened Play Some Lofi On Youtube."
+  },
+  {
+   "category": "follow-up",
+   "said": "pause it",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "play_pause"
+    ]
+   ],
+   "reply": "Toggled play/pause."
+  },
+  {
+   "category": "follow-up",
+   "said": "ok resume it",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "play_pause"
+    ]
+   ],
+   "reply": "Toggled play/pause."
+  },
+  {
+   "category": "follow-up",
+   "said": "open chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "follow-up",
+   "said": "and also open spotify",
+   "passed": true,
+   "problems": [],
+   "seconds": 5.39,
+   "path": "ai",
+   "actions": [
+    [
+     "open",
+     "spotify"
+    ]
+   ],
+   "reply": "Spotify has been opened successfully."
+  },
+  {
+   "category": "follow-up",
+   "said": "remind me to call mom at 6",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "schedule",
+     "remind me to call mom at 6"
+    ]
+   ],
+   "reply": "Reminder set: remind me to call mom at 6."
+  },
+  {
+   "category": "follow-up",
+   "said": "actually make it 7 instead",
+   "passed": false,
+   "problems": [
+    "missing schedule(7)"
+   ],
+   "seconds": 5.41,
+   "path": "ai",
+   "actions": [],
+   "reply": "Sorry, I didn't manage to do that. Could you say it another way, or name the app?"
+  },
+  {
+   "category": "follow-up",
+   "said": "write a two line poem about rain in notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 3.01,
+   "path": "ai",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ],
+    [
+     "focus",
+     "notepad"
+    ],
+    [
+     "type",
+     "Notepad: Rain taps a rhythm on the roof,  \na quiet song the world can't ignore."
+    ]
+   ],
+   "reply": "Done \u2014 wrote 14 words and typed them into notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "what did i ask you to write?",
+   "passed": true,
+   "problems": [],
+   "seconds": 3.01,
+   "path": "ai",
+   "actions": [],
+   "reply": "You asked me to write a two-line poem about rain, which I did in Notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "open notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ]
+   ],
+   "reply": "Opened Notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "open chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "follow-up",
+   "said": "go back to notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "focus",
+     "notepad"
+    ]
+   ],
+   "reply": "Switched to 'Notepad'."
+  },
+  {
+   "category": "follow-up",
+   "said": "what's the weather in pune",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "weather",
+     "what's the weather in pune"
+    ]
+   ],
+   "reply": "It's 24\u00b0C and sunny in Pune."
+  },
+  {
+   "category": "follow-up",
+   "said": "what about mumbai",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "weather",
+     "weather in mumbai"
+    ]
+   ],
+   "reply": "It's 24\u00b0C and sunny in Pune."
+  }
+ ]
+}

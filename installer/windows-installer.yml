@@ -1,0 +1,56 @@
+# To use: copy this file to .github/workflows/windows-installer.yml in your GitHub repo.
+# Builds JARVIS-Setup-<version>.exe on a real Windows machine for every push/PR (and on demand).
+# Download it from the run's "Artifacts" section. Pushing a tag like v3.1.0 also attaches it to a Release.
+name: Windows installer
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies (without the 1 GB Laya/PyTorch model)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          (Get-Content requirements.txt) -notmatch '^\s*laya' | Set-Content requirements-ci.txt
+          python -m pip install -r requirements-ci.txt "pyinstaller>=6.10"
+
+      - name: Unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          JARVIS_DECISION_ENGINE: rules
+        run: python -m unittest discover -s tests
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build app + installer
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python build/build_installer.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JARVIS-Setup
+          path: dist/JARVIS-Setup-*.exe
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/JARVIS-Setup-*.exe

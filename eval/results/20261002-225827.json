@@ -1,0 +1,1056 @@
+{
+ "model": "ollama:qwen3:4b-instruct",
+ "laya": false,
+ "results": [
+  {
+   "category": "open",
+   "said": "open chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.02,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "open",
+   "said": "start chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "open",
+   "said": "go to chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "open",
+   "said": "hi um can you like start chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "open",
+   "said": "chrome please",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "open",
+   "said": "hey jarvis could you please fire up spotify for me",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "spotify"
+    ]
+   ],
+   "reply": "Opened Spotify."
+  },
+  {
+   "category": "open",
+   "said": "uh launch notepad real quick",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ]
+   ],
+   "reply": "Opened Notepad."
+  },
+  {
+   "category": "open",
+   "said": "can you get youtube up",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "youtube"
+    ]
+   ],
+   "reply": "Opened Youtube."
+  },
+  {
+   "category": "open",
+   "said": "pull the calculator up",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "calculator"
+    ]
+   ],
+   "reply": "Opened Calculator."
+  },
+  {
+   "category": "open",
+   "said": "yo open whatsapp",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "whatsapp"
+    ]
+   ],
+   "reply": "Opened Whatsapp."
+  },
+  {
+   "category": "open",
+   "said": "please bring up file explorer",
+   "passed": false,
+   "problems": [
+    "missing open(explorer)"
+   ],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "file_skill.handle_file_command",
+     "open file explorer"
+    ]
+   ],
+   "reply": "Done."
+  },
+  {
+   "category": "open",
+   "said": "take me to youtube",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "youtube"
+    ]
+   ],
+   "reply": "Opened Youtube."
+  },
+  {
+   "category": "open",
+   "said": "i need the calculator",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "calculator"
+    ]
+   ],
+   "reply": "Opened Calculator."
+  },
+  {
+   "category": "open",
+   "said": "could you open up word for me",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "word"
+    ]
+   ],
+   "reply": "Opened Word."
+  },
+  {
+   "category": "open",
+   "said": "open settings",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "settings"
+    ]
+   ],
+   "reply": "Opened Settings \u2014    ."
+  },
+  {
+   "category": "open",
+   "said": "can i get notepad open",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ]
+   ],
+   "reply": "Opened Notepad."
+  },
+  {
+   "category": "media",
+   "said": "pause it",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "play_pause"
+    ]
+   ],
+   "reply": "Toggled play/pause."
+  },
+  {
+   "category": "media",
+   "said": "resume the music",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "play_pause"
+    ]
+   ],
+   "reply": "Toggled play/pause."
+  },
+  {
+   "category": "media",
+   "said": "skip this song",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "next"
+    ]
+   ],
+   "reply": "Skipped."
+  },
+  {
+   "category": "media",
+   "said": "next one",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "next"
+    ]
+   ],
+   "reply": "Skipped."
+  },
+  {
+   "category": "media",
+   "said": "go back to the previous track",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "previous"
+    ]
+   ],
+   "reply": "Went back."
+  },
+  {
+   "category": "media",
+   "said": "stop the music",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "stop"
+    ]
+   ],
+   "reply": "Stopped."
+  },
+  {
+   "category": "media",
+   "said": "turn it up a bit",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "volume_change",
+     "10"
+    ]
+   ],
+   "reply": "Volume up."
+  },
+  {
+   "category": "media",
+   "said": "um so like turn the volume up a bit",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "volume_change",
+     "10"
+    ]
+   ],
+   "reply": "Volume up."
+  },
+  {
+   "category": "media",
+   "said": "make it quieter",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "volume_change",
+     "-10"
+    ]
+   ],
+   "reply": "Volume down."
+  },
+  {
+   "category": "media",
+   "said": "set the volume to 30",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "volume_set",
+     "30"
+    ]
+   ],
+   "reply": "Volume set to 30%."
+  },
+  {
+   "category": "media",
+   "said": "mute",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "mute",
+     "True"
+    ]
+   ],
+   "reply": "Muted."
+  },
+  {
+   "category": "media",
+   "said": "play some lofi on youtube",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "play some lofi on youtube"
+    ]
+   ],
+   "reply": "Opened Play Some Lofi On Youtube."
+  },
+  {
+   "category": "media",
+   "said": "i wanna listen to some jazz on spotify",
+   "passed": false,
+   "problems": [
+    "missing open(jazz)"
+   ],
+   "seconds": 5.63,
+   "path": "ai",
+   "actions": [
+    [
+     "open",
+     "spotify"
+    ]
+   ],
+   "reply": "Spotify is now open. Would you like me to play some jazz for you? If so, I can set it up right away."
+  },
+  {
+   "category": "schedule",
+   "said": "remind me to call mom at 6",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "schedule",
+     "remind me to call mom at 6"
+    ]
+   ],
+   "reply": "Reminder set: remind me to call mom at 6."
+  },
+  {
+   "category": "schedule",
+   "said": "could you maybe remind me to drink water in 20 minutes",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "schedule",
+     "remind me to drink water in 20 minutes"
+    ]
+   ],
+   "reply": "Reminder set: remind me to drink water in 20 minutes."
+  },
+  {
+   "category": "schedule",
+   "said": "set an alarm for 7 am",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "schedule",
+     "2026-10-03 07:00:00 "
+    ]
+   ],
+   "reply": "Reminder set: 2026-10-03 07:00:00 ."
+  },
+  {
+   "category": "schedule",
+   "said": "um, uh, wake me up at 6:30 tomorrow, thanks",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "schedule",
+     "2026-10-03 06:30:00 "
+    ]
+   ],
+   "reply": "Reminder set: 2026-10-03 06:30:00 ."
+  },
+  {
+   "category": "chat",
+   "said": "how are you doing today",
+   "passed": true,
+   "problems": [],
+   "seconds": 2.84,
+   "path": "ai",
+   "actions": [],
+   "reply": "Aristotle once said, \"The whole of life is a question of how to live.\" I'm functioning optimally, thank you for asking. How can I assist you tonight?"
+  },
+  {
+   "category": "chat",
+   "said": "what is world peace",
+   "passed": true,
+   "problems": [],
+   "seconds": 4.88,
+   "path": "ai",
+   "actions": [],
+   "reply": "World peace is the state in which all nations, communities, and individuals live in harmony, free from conflict, violence, and oppression. It involves not just the absence of war, but also the promotion of justice, equality, cooperation, and mutual respect among all people, regardless of background,"
+  },
+  {
+   "category": "chat",
+   "said": "tell me a joke",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "utility_skill.tell_joke",
+     ""
+    ]
+   ],
+   "reply": "Done."
+  },
+  {
+   "category": "chat",
+   "said": "explain black holes in one sentence",
+   "passed": true,
+   "problems": [],
+   "seconds": 2.74,
+   "path": "ai",
+   "actions": [],
+   "reply": "A black hole is a region of spacetime where gravity is so intense that nothing, not even light, can escape from it."
+  },
+  {
+   "category": "chat",
+   "said": "what time is it",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [],
+   "reply": "It's 10:57 PM on Friday, October 02."
+  },
+  {
+   "category": "chat",
+   "said": "thanks jarvis",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [],
+   "reply": "You're welcome."
+  },
+  {
+   "category": "compose",
+   "said": "write a two line poem about rain in notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 3.0,
+   "path": "ai",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ],
+    [
+     "focus",
+     "notepad"
+    ],
+    [
+     "type",
+     "Notepad: Rain taps a rhythm on the roof,  \nturning silence into song."
+    ]
+   ],
+   "reply": "Done \u2014 wrote 11 words and typed them into notepad."
+  },
+  {
+   "category": "compose",
+   "said": "open notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ]
+   ],
+   "reply": "Opened Notepad."
+  },
+  {
+   "category": "compose",
+   "said": "write an essay about world peace and type it there",
+   "passed": true,
+   "problems": [],
+   "seconds": 12.63,
+   "path": "ai",
+   "actions": [
+    [
+     "focus",
+     "Notepad"
+    ],
+    [
+     "type",
+     "Notepad: World peace is the state in which all nations, peoples, and individuals live free from war, violence, and oppression. It is not merely the absence of conflict, but the presence of mutual respect, justice, cooperation, and shared human dignity. Achieving world peace is one of the most pressing and enduring challenges of the modern era. It requires not only political and military restraint but also profound shifts in values, economics, education, and global governance.\n\nHistorically, human civilizations have been shaped by wars, conquests, and power struggles. From ancient empires to modern nation-states, the pursuit of dominance has often led to suffering and destruction. The horrors of World War I and II\u2014millions of deaths, widespread displacement, and the collapse of entire societies\u2014serve as stark reminders of what happens when peace is abandoned. These tragedies have also inspired a growing global consciousness about the moral imperative to prevent such violence. The establishment of international institutions like the United Nations, the creation of human rights frameworks, and the rise of global awareness campaigns all reflect a collective effort to build a more peaceful world.\n\nHowever, peace is not a static condition. It is fragile and constantly under threat. Regional conflicts, ideological divisions, economic inequalities, and climate change continue to fuel instability. The proliferation of weapons, the rise of extremism, and the erosion of trust between nations and communities challenge the foundations of peace. Moreover, peace cannot be achieved through the domination of one group over another. It requires inclusivity, dialogue, and the recognition that all human beings possess inherent worth.\n\nEconomic justice plays a vital role in peace. Poverty, inequality, and lack of opportunity breed resentment and radicalization. When people feel marginalized or excluded, they are more likely to support movements that promise change through force. A world where resources are distributed fairly, education is accessible, and opportunities are open to all is more likely to foster stability and mutual understanding.\n\nEducation and cultural exchange are powerful tools for peace. When individuals learn about different cultures, histories, and perspectives, they develop empathy and reduce prejudice. Schools and communities that emphasize tolerance, critical thinking, and active citizenship help cultivate a generation that values peace over power.\n\nGlobal cooperation is essential. No single nation can achieve peace alone. Diplomacy, multilateral agreements, and shared responsibilities must guide international relations. Institutions like the United Nations, the International Court of Justice, and regional bodies provide platforms for negotiation and conflict resolution. Yet, these institutions must be strengthened and upheld with genuine commitment and accountability.\n\nUltimately, world peace is not just a political or military goal\u2014it is a moral one. It reflects our shared humanity and our collective responsibility to create a world where every person can live with safety, dignity, and hope. Peace is not the end of struggle, but the beginning of a new way of living\u2014one defined not by fear, but by compassion; not by power, but by partnership.\n\nTo build world peace, we must act not only in our governments and institutions, but in our homes, schools, and communities. We must listen to one another, forgive when possible, and work tirelessly to understand and resolve differences. In doing so, we do not just aim for peace\u2014we embody it. And in that embodiment, we create a future where peace is not a distant ideal, but a lived reality for all."
+    ]
+   ],
+   "reply": "Done \u2014 wrote 554 words and typed them into Notepad."
+  },
+  {
+   "category": "compose",
+   "said": "draft a short email asking my boss for friday off in word",
+   "passed": true,
+   "problems": [],
+   "seconds": 3.98,
+   "path": "ai",
+   "actions": [
+    [
+     "open",
+     "word"
+    ],
+    [
+     "focus",
+     "word"
+    ],
+    [
+     "type",
+     "Word: Subject: Request for Friday Off  \n\nHi [Boss's Name],  \n\nI hope you're doing well. I'd like to kindly request Friday off for personal reasons. I\u2019ll make sure all my current tasks are either completed or handed off before the day ends.  \n\nLet me know if you need any updates or if it\u2019s better to adjust the request.  \n\nThanks for your understanding!  \n\nBest regards,  \n[Your Name]"
+    ]
+   ],
+   "reply": "Done \u2014 wrote 64 words and typed them into word."
+  },
+  {
+   "category": "compose",
+   "said": "type hello world",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "type",
+     "Notepad: hello world"
+    ]
+   ],
+   "reply": "Typed 11 character(s)."
+  },
+  {
+   "category": "compose",
+   "said": "type an email to my landlord about the broken tap",
+   "passed": true,
+   "problems": [],
+   "seconds": 6.7,
+   "path": "ai",
+   "actions": [
+    [
+     "focus",
+     "Notepad"
+    ],
+    [
+     "type",
+     "Notepad: Subject: Broken Tap in Apartment \u2013 Request for Repair  \n\nDear [Landlord's Name],  \n\nI hope this message finds you well. I\u2019m writing to inform you that the tap in the kitchen of my apartment (Unit [Your Unit Number]) has stopped working and is currently leaking.  \n\nThe tap is located on the left side of the sink, and I\u2019ve noticed water dripping from the spout over the past few hours. This has caused a small puddle on the floor and is creating a mess that\u2019s becoming harder to manage. I\u2019ve tried turning it off and checking for blockages, but the issue persists.  \n\nCould you please arrange for a plumber to inspect and repair the tap at your earliest convenience? I\u2019d appreciate it if this is addressed as soon as possible to avoid further damage or inconvenience.  \n\nThank you for your attention to this matter. Please let me know if you need any additional information or if you\u2019d like to schedule a time for the repair.  \n\nBest regards,  \n[Your Full Name]  \n[Your Apartment Number]  \n[Your Phone Number, if appropriate]"
+    ]
+   ],
+   "reply": "Done \u2014 wrote 176 words and typed them into Notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "open notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ]
+   ],
+   "reply": "Opened Notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "actually close that",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "close",
+     "notepad"
+    ]
+   ],
+   "reply": "Close notepad? Unsaved work in it may be lost. Reply yes to confirm, or no to cancel. \u2192 yes \u2192 Closed notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "open spotify",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "spotify"
+    ]
+   ],
+   "reply": "Opened Spotify."
+  },
+  {
+   "category": "follow-up",
+   "said": "close it",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "close",
+     "spotify"
+    ]
+   ],
+   "reply": "Close spotify? Unsaved work in it may be lost. Reply yes to confirm, or no to cancel. \u2192 yes \u2192 Closed spotify."
+  },
+  {
+   "category": "follow-up",
+   "said": "open notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ]
+   ],
+   "reply": "Opened Notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "write a haiku about coffee and put it there",
+   "passed": true,
+   "problems": [],
+   "seconds": 3.18,
+   "path": "ai",
+   "actions": [
+    [
+     "focus",
+     "Notepad"
+    ],
+    [
+     "type",
+     "Notepad: Brewed in morning light,  \nSteam rises, warm and bold\u2014  \nOne sip, world awakes."
+    ]
+   ],
+   "reply": "Done \u2014 wrote 13 words and typed them into Notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "now close it",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "close",
+     "notepad"
+    ]
+   ],
+   "reply": "Close notepad? Unsaved work in it may be lost. Reply yes to confirm, or no to cancel. \u2192 yes \u2192 Closed notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "play some lofi on youtube",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "play some lofi on youtube"
+    ]
+   ],
+   "reply": "Opened Play Some Lofi On Youtube."
+  },
+  {
+   "category": "follow-up",
+   "said": "pause it",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "play_pause"
+    ]
+   ],
+   "reply": "Toggled play/pause."
+  },
+  {
+   "category": "follow-up",
+   "said": "ok resume it",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "play_pause"
+    ]
+   ],
+   "reply": "Toggled play/pause."
+  },
+  {
+   "category": "follow-up",
+   "said": "open chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "follow-up",
+   "said": "and also open spotify",
+   "passed": true,
+   "problems": [],
+   "seconds": 5.78,
+   "path": "ai",
+   "actions": [
+    [
+     "open",
+     "spotify"
+    ]
+   ],
+   "reply": "Spotify has been opened successfully."
+  },
+  {
+   "category": "follow-up",
+   "said": "remind me to call mom at 6",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "schedule",
+     "remind me to call mom at 6"
+    ]
+   ],
+   "reply": "Reminder set: remind me to call mom at 6."
+  },
+  {
+   "category": "follow-up",
+   "said": "actually make it 7 instead",
+   "passed": false,
+   "problems": [
+    "missing schedule(7)"
+   ],
+   "seconds": 5.37,
+   "path": "ai",
+   "actions": [],
+   "reply": "Sorry, I didn't manage to do that. Could you say it another way, or name the app?"
+  },
+  {
+   "category": "follow-up",
+   "said": "write a two line poem about rain in notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 2.99,
+   "path": "ai",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ],
+    [
+     "focus",
+     "notepad"
+    ],
+    [
+     "type",
+     "Notepad: Rain taps a rhythm on the roof,  \na silver thread weaving through the sky."
+    ]
+   ],
+   "reply": "Done \u2014 wrote 14 words and typed them into notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "what did i ask you to write?",
+   "passed": true,
+   "problems": [],
+   "seconds": 3.36,
+   "path": "ai",
+   "actions": [],
+   "reply": "You asked me to write a two-line poem about rain, which I did in Notepad. The poem is:  \n\nRain taps a rhythm on the roof,  \na silver thread weaving through the sky."
+  },
+  {
+   "category": "follow-up",
+   "said": "open notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ]
+   ],
+   "reply": "Opened Notepad."
+  },
+  {
+   "category": "follow-up",
+   "said": "open chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "follow-up",
+   "said": "go back to notepad",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "focus",
+     "notepad"
+    ]
+   ],
+   "reply": "Switched to 'Notepad'."
+  },
+  {
+   "category": "follow-up",
+   "said": "what's the weather in pune",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "weather",
+     "what's the weather in pune"
+    ]
+   ],
+   "reply": "It's 24\u00b0C and sunny in Pune."
+  },
+  {
+   "category": "follow-up",
+   "said": "what about mumbai",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "weather",
+     "weather in mumbai"
+    ]
+   ],
+   "reply": "It's 24\u00b0C and sunny in Pune."
+  },
+  {
+   "category": "multi",
+   "said": "open chrome and spotify",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome and spotify"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "multi",
+   "said": "open notepad then type hello there",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.81,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ],
+    [
+     "type",
+     "Notepad: hello there"
+    ]
+   ],
+   "reply": "Ran 2 steps:\n1. open notepad \u2192 Opened Notepad.\n2. type hello there \u2192 Typed 11 character(s)."
+  },
+  {
+   "category": "multi",
+   "said": "pause the music and turn the volume down",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "media",
+     "play_pause"
+    ],
+    [
+     "volume_change",
+     "-10"
+    ]
+   ],
+   "reply": "Ran 2 steps:\n1. pause the music \u2192 Toggled play/pause.\n2. turn the volume down \u2192 Volume down."
+  }
+ ]
+}

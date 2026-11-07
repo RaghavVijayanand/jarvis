@@ -1,11 +1,53 @@
 import requests
 from bs4 import BeautifulSoup
-import json
+import html
+import ipaddress
 import re
-from urllib.parse import quote, urljoin, urlparse
-from datetime import datetime
+import socket
+import xml.etree.ElementTree as ET
+from urllib.parse import quote, urljoin, urlparse, parse_qs
 import time
 import random
+
+DDG_HTML_URL = "https://html.duckduckgo.com/html/"
+_MAX_PAGE_BYTES = 5 * 1024 * 1024
+
+
+def is_public_http_url(url):
+    """True only for http(s) URLs whose host resolves to public addresses.
+
+    Guards read_webpage against user/search-result text pointing at file://,
+    localhost, the LAN or cloud metadata endpoints (SSRF-style reads)."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    host = parsed.hostname
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        except ValueError:
+            return False
+        if not ip.is_global:
+            return False
+    return True
+
+
+def _google_href_to_url(href):
+    """Resolve a Google result href (possibly a /url?q= redirect) to the target URL."""
+    if href.startswith('/url?'):
+        target = parse_qs(urlparse(href).query).get('q', [''])[0]
+        return target if target.startswith('http') else ''
+    return href if href.startswith('http') else ''
+
 
 class WebScraperSkill:
     def __init__(self):
@@ -14,17 +56,32 @@ class WebScraperSkill:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         })
         self.timeout = 15
-        
+
+    @staticmethod
+    def _looks_blocked(response) -> bool:
+        """Detect CAPTCHA/block pages (UC 9.1): a 200 page can still be a block."""
+        if response.status_code in (429, 503):
+            return True
+        try:
+            text = response.text[:5000].lower()
+        except Exception:
+            return False
+        # 'enablejs' = Google's JavaScript wall served to non-JS clients.
+        markers = ('/sorry/', 'captcha', 'unusual traffic', 'are you a robot', '/httpservice/retry/enablejs')
+        return any(marker in text for marker in markers)
+
     def search_google(self, query, num_results=5):
         """Search Google and return results without opening browser"""
         try:
             # Use Google search URL with additional parameters for better results
             search_url = f"https://www.google.com/search?q={quote(query)}&num={num_results}&hl=en"
-            
+
             # Add random delay to avoid being blocked
             time.sleep(random.uniform(1, 3))
-            
+
             response = self.session.get(search_url, timeout=self.timeout)
+            if self._looks_blocked(response):
+                return self._try_alternative_search(query)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -57,13 +114,9 @@ class WebScraperSkill:
                     )
                     url = ""
                     if link_element and link_element.get('href'):
-                        href = link_element['href']
-                        if href.startswith('/url?q='):
-                            # Extract actual URL from Google redirect
-                            url = href.split('/url?q=')[1].split('&')[0]
-                        elif href.startswith('http'):
-                            url = href
-                    
+                        # Unwraps (and percent-decodes) Google's /url?q= redirect
+                        url = _google_href_to_url(link_element['href'])
+
                     # Get snippet - try multiple selectors
                     snippet_elements = (
                         container.find_all(['span', 'div'], class_=['st', 'VwiC3b', 'yXK7lf', 's3v9rd']) or
@@ -75,7 +128,7 @@ class WebScraperSkill:
                         if len(text) > 30 and not any(skip in text.lower() for skip in ['javascript', 'cookie', 'privacy']):
                             snippet = text[:300]  # Limit snippet length
                             break
-                    
+
                     if title and len(title) > 2:  # Ensure we have meaningful content
                         results.append({
                             'title': title.strip(),
@@ -139,24 +192,40 @@ class WebScraperSkill:
         """Try alternative search methods when Google fails"""
         try:
             # Try DuckDuckGo as fallback
-            ddg_url = f"https://duckduckgo.com/html/?q={quote(query)}"
+            # html.duckduckgo.com is the canonical no-JS endpoint (duckduckgo.com/html
+            # only redirects there). A 202 status is DDG's rate-limit/anomaly reply.
+            ddg_url = f"{DDG_HTML_URL}?q={quote(query)}"
             response = self.session.get(ddg_url, timeout=self.timeout)
             
             if response.status_code == 200:
+                probe = response.text[:5000].lower()
+                ddg_blocked = ('captcha' in probe or 'anomaly' in probe
+                               or 'challenge' in probe or 'duckduckbot' in probe)
+                if ddg_blocked:
+                    return (f"Search engines are currently blocking automated requests for '{query}'. "
+                            f"Try these links:\n\n🔗 Google: https://www.google.com/search?q={quote(query)}\n🔗 DuckDuckGo: https://duckduckgo.com/?q={quote(query)}")
                 soup = BeautifulSoup(response.content, 'html.parser')
                 results = []
                 
                 # DuckDuckGo result containers
-                for result_div in soup.find_all('div', class_='result')[:3]:
+                organic = [d for d in soup.find_all('div', class_='result')
+                           if 'result--ad' not in (d.get('class') or [])]
+                for result_div in organic[:3]:
                     title_elem = result_div.find('a', class_='result__a')
                     snippet_elem = result_div.find('a', class_='result__snippet')
                     
                     if title_elem:
                         title = title_elem.get_text()
                         url = title_elem.get('href', '')
+                        if url.startswith('//'):
+                            url = 'https:' + url
+                        if 'uddg=' in url:
+                            params = parse_qs(urlparse(url).query)
+                            if 'uddg' in params:
+                                url = params['uddg'][0]
                         snippet = snippet_elem.get_text() if snippet_elem else ""
                         
-                        results.append(f"• {title}\n  {snippet[:150]}...")
+                        results.append(f"• {title}\n  {url}\n  {snippet[:150]}...")
                 
                 if results:
                     return f"🔍 Search results for '{query}' (via DuckDuckGo):\n\n" + "\n\n".join(results)
@@ -167,87 +236,16 @@ class WebScraperSkill:
         except Exception:
             return f"No search results found for '{query}'"
     
-    def search_google_with_urls(self, query, num_results=5):
-        """Search Google and return structured results with URLs for further processing"""
-        try:
-            # Use Google search URL with additional parameters for better results
-            search_url = f"https://www.google.com/search?q={quote(query)}&num={num_results}&hl=en"
-            
-            # Add random delay to avoid being blocked
-            time.sleep(random.uniform(1, 3))
-            
-            response = self.session.get(search_url, timeout=self.timeout)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            results = []
-            
-            # Try multiple selectors for search results
-            search_containers = (
-                soup.find_all('div', class_='g') or
-                soup.find_all('div', {'data-hveid': True}) or
-                soup.find_all('div', class_='tF2Cxc') or
-                soup.find_all('div', class_='kCrYT')
-            )
-            
-            for container in search_containers[:num_results]:
-                try:
-                    # Get title - try multiple selectors
-                    title_element = (
-                        container.find('h3') or
-                        container.find('h3', class_='LC20lb') or
-                        container.find('h3', class_='r') or
-                        container.find('a')
-                    )
-                    title = title_element.get_text() if title_element else "No title"
-                    
-                    # Get URL - try multiple selectors
-                    link_element = (
-                        container.find('a', href=True) or
-                        container.find('a', {'data-ved': True})
-                    )
-                    url = ""
-                    if link_element and link_element.get('href'):
-                        href = link_element['href']
-                        if href.startswith('/url?q='):
-                            # Extract actual URL from Google redirect
-                            url = href.split('/url?q=')[1].split('&')[0]
-                        elif href.startswith('http'):
-                            url = href
-                    
-                    # Get snippet - try multiple selectors
-                    snippet_elements = (
-                        container.find_all(['span', 'div'], class_=['st', 'VwiC3b', 'yXK7lf', 's3v9rd']) or
-                        container.find_all(['span', 'div'], string=re.compile(r'.{20,}'))
-                    )
-                    snippet = ""
-                    for elem in snippet_elements:
-                        text = elem.get_text()
-                        if len(text) > 30 and not any(skip in text.lower() for skip in ['javascript', 'cookie', 'privacy']):
-                            snippet = text[:300]  # Limit snippet length
-                            break
-                    
-                    if title and len(title) > 2 and url:  # Ensure we have meaningful content and URL
-                        results.append({
-                            'title': title.strip(),
-                            'url': url.strip(),
-                            'snippet': snippet.strip()
-                        })
-                        
-                except Exception:
-                    continue
-            
-            return results
-            
-        except Exception as e:
-            return []
-
     def search_wikipedia(self, query):
         """Search Wikipedia and get article summary"""
         try:
-            # Use Wikipedia API for search
-            search_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(query)}"
+            query = (query or '').strip()
+            if not query:
+                return "Please tell me what to look up on Wikipedia."
+            # REST summary endpoint takes a title path segment: spaces -> '_', and
+            # '/' must be escaped too (quote() keeps it by default: "AC/DC" broke).
+            title_path = quote(query.replace(' ', '_'), safe='')
+            search_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title_path}"
             
             response = self.session.get(search_url, timeout=self.timeout)
             
@@ -255,11 +253,13 @@ class WebScraperSkill:
                 data = response.json()
                 
                 title = data.get('title', 'Unknown')
-                extract = data.get('extract', 'No summary available')
+                extract = data.get('extract') or 'No summary available'
                 page_url = data.get('content_urls', {}).get('desktop', {}).get('page', '')
                 
                 result = f"Wikipedia: {title}\n\n"
                 result += f"{extract}\n\n"
+                if data.get('type') == 'disambiguation':
+                    result += "That title is ambiguous; try a more specific name.\n\n"
                 if page_url:
                     result += f"Full article: {page_url}"
                 
@@ -284,6 +284,8 @@ class WebScraperSkill:
             }
             
             response = self.session.get(search_url, params=params, timeout=self.timeout)
+            if response.status_code != 200:
+                return f"Wikipedia is not responding right now (HTTP {response.status_code}). Please try again shortly."
             data = response.json()
             
             if 'query' in data and 'search' in data['query'] and data['query']['search']:
@@ -291,12 +293,14 @@ class WebScraperSkill:
                 snippet = data['query']['search'][0]['snippet']
                 
                 # Clean HTML tags from snippet
-                snippet = re.sub(r'<[^>]+>', '', snippet)
+                snippet = html.unescape(re.sub(r'<[^>]+>', '', snippet))
                 
                 return f"Wikipedia: {page_title}\n\n{snippet}\n\nFor full article, visit: https://en.wikipedia.org/wiki/{quote(page_title.replace(' ', '_'))}"
             else:
                 return f"No Wikipedia article found for '{query}'"
                 
+        except requests.RequestException:
+            return f"I couldn't reach Wikipedia to look up '{query}'. Please check your connection."
         except Exception as e:
             return f"Error searching Wikipedia: {e}"
     
@@ -338,16 +342,23 @@ class WebScraperSkill:
         """Get news from Google News"""
         try:
             url = "https://news.google.com/rss"
-            response = self.session.get(url, timeout=self.timeout)
-            
-            soup = BeautifulSoup(response.content, 'xml')
-            items = soup.find_all('item')
+            response = self.session.get(url, params={'hl': 'en-US', 'gl': 'US', 'ceid': 'US:en'},
+                                        timeout=self.timeout)
+            if response.status_code != 200:
+                return []
+            # Parse RSS with the stdlib: BeautifulSoup's 'xml' mode needs lxml,
+            # which is not in requirements.txt, so it raised and returned [].
+            root = ET.fromstring(response.content)
             
             headlines = []
-            for item in items[:limit]:
-                title = item.find('title').text if item.find('title') else "No title"
-                link = item.find('link').text if item.find('link') else ""
-                description = item.find('description').text if item.find('description') else ""
+            for item in root.iter('item'):
+                if len(headlines) >= limit:
+                    break
+                title = (item.findtext('title') or '').strip() or "No title"
+                link = (item.findtext('link') or '').strip()
+                description = item.findtext('description') or ''
+                # Google News descriptions are HTML fragments; keep plain text.
+                description = BeautifulSoup(description, 'html.parser').get_text(' ', strip=True)
                 
                 headlines.append({
                     'title': title,
@@ -370,7 +381,11 @@ class WebScraperSkill:
             
             headlines = []
             # Look for BBC news headlines
-            headline_elements = soup.find_all(['h3', 'h2'], class_=re.compile(r'.*headline.*|.*title.*'))
+            # Current BBC markup: <h2 data-testid="card-headline">; older: class*=headline.
+            headline_elements = (
+                soup.find_all(['h3', 'h2'], attrs={'data-testid': re.compile(r'headline')}) or
+                soup.find_all(['h3', 'h2'], class_=re.compile(r'.*headline.*|.*title.*'))
+            )
             
             for elem in headline_elements[:limit]:
                 title = elem.get_text().strip()
@@ -425,10 +440,31 @@ class WebScraperSkill:
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
             
-            response = self.session.get(url, timeout=self.timeout)
-            response.raise_for_status()
+            if not is_public_http_url(url):
+                return f"I can only read public web pages; '{url}' is a local or unsupported address."
             
-            soup = BeautifulSoup(response.content, 'html.parser')
+            # Follow redirects by hand so every hop is checked *before* it is requested: a public
+            # page must not be able to bounce a GET onto the router or another LAN device.
+            target = url
+            for _hop in range(6):
+                response = self.session.get(target, timeout=self.timeout, allow_redirects=False, stream=True)
+                if not response.is_redirect:
+                    break
+                target = urljoin(target, response.headers.get('Location', ''))
+                response.close()
+                if not is_public_http_url(target):
+                    return f"I can only read public web pages; '{url}' redirected to a local address."
+            else:
+                return f"'{url}' redirected too many times."
+            response.raise_for_status()
+            body = b""
+            for chunk in response.iter_content(64 * 1024):
+                body += chunk
+                if len(body) > _MAX_PAGE_BYTES:
+                    break                              # enough to read; never buffer a huge download
+            response.close()
+
+            soup = BeautifulSoup(body, 'html.parser')
             
             # Remove script and style elements
             for script in soup(["script", "style"]):
@@ -481,15 +517,12 @@ class WebScraperSkill:
             # First search Google
             search_results = self.search_google(query, num_results=3)
             
-            if read_first and "Google search results" in search_results:
-                # Extract first URL from search results
-                lines = search_results.split('\n')
-                first_url = None
-                
-                for line in lines:
-                    if line.strip().startswith('URL:'):
-                        first_url = line.split('URL:', 1)[1].strip()
-                        break
+            if read_first and search_results.startswith("🔍 Search results for"):
+                # First result URL: Google lines are "🔗 <url>", DDG lines are bare URLs.
+                # (Previously looked for a "Google search results"/"URL:" format that
+                # search_google never produces, so nothing was ever read.)
+                match = re.search(r'^\s*(?:🔗\s*)?(https?://\S+)\s*$', search_results, re.MULTILINE)
+                first_url = match.group(1) if match else None
                 
                 if first_url:
                     # Add a delay to be respectful
@@ -504,25 +537,6 @@ class WebScraperSkill:
         except Exception as e:
             return f"Error in search and read: {e}"
     
-    def get_weather_from_web(self, city=""):
-        """Alternative weather scraping (backup for weather skill)"""
-        try:
-            if city:
-                url = f"https://wttr.in/{city}?format=%l:+%C+%t+%h+%w+%p"
-            else:
-                url = "https://wttr.in/?format=%l:+%C+%t+%h+%w+%p"
-            
-            headers = {'User-Agent': 'curl/7.68.0'}
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                return f"Weather: {response.text.strip()}"
-            else:
-                return "Unable to fetch weather data"
-                
-        except Exception as e:
-            return f"Weather fetch error: {e}"
-    
     def search_specific_site(self, query, site):
         """Search within a specific website"""
         try:
@@ -532,29 +546,6 @@ class WebScraperSkill:
             
         except Exception as e:
             return f"Error searching {site}: {e}"
-    
-    def get_stock_info(self, symbol):
-        """Get basic stock information"""
-        try:
-            # Simple stock info from Yahoo Finance
-            url = f"https://finance.yahoo.com/quote/{symbol.upper()}"
-            
-            response = self.session.get(url, timeout=self.timeout)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Try to extract stock price
-            price_elem = soup.find('fin-streamer', {'data-field': 'regularMarketPrice'})
-            if not price_elem:
-                price_elem = soup.find('span', class_=re.compile(r'.*price.*'))
-            
-            if price_elem:
-                price = price_elem.get_text()
-                return f"{symbol.upper()} stock price: {price}"
-            else:
-                return f"Could not fetch stock price for {symbol.upper()}"
-                
-        except Exception as e:
-            return f"Error fetching stock info: {e}"
     
     def quick_fact(self, topic):
         """Get a quick fact about something using Wikipedia"""
@@ -567,7 +558,7 @@ class WebScraperSkill:
                 if len(lines) >= 3:
                     fact = lines[2]  # Skip title and empty line
                     sentences = fact.split('. ')
-                    return f"Quick fact about {topic}: {sentences[0]}."
+                    return f"Quick fact about {topic}: {sentences[0].rstrip('.')}."
             
             # Fallback to Google search
             search_result = self.search_google(f"what is {topic}", num_results=1)

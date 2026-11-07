@@ -1,29 +1,3 @@
-# Core GUI and System
-PySide6>=6.5.0
-pyautogui>=0.9.54
-Pillow>=10.0.0
-psutil>=5.9.0
-
-# AI and Language Models
-openai>=1.0.0
-anthropic>=0.7.0
-google-generativeai>=0.3.0
-requests>=2.31.0
-
-# Voice and Audio
-pyttsx3>=2.90
-SpeechRecognition>=3.10.0
-pyaudio>=0.2.11
-
-# Windows-specific
-pywin32>=306
-
-# Utilities
-rich>=13.5.0
-numpy>=1.24.0
-
-# Optional - for advanced features
-langchain>=0.0.350
-langchain-openai>=0.0.5
-langchain-anthropic>=0.1.0
-transformers>=4.35.0
+# Build dependencies for the packaged JARVIS.exe (python build/build_exe.py)
+-r requirements.txt
+pyinstaller>=6.10

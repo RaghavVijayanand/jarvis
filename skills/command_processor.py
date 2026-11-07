@@ -1,548 +1,299 @@
-"""
-Enhanced Command Processing Skill for JARVIS
-Handles complex compound commands and natural language parsing
-"""
+"""Compound-command planning and execution — sequential steps and parallel lanes.
 
+"Open Chrome and go to YouTube and play Rick Roll and move to the next video,
+simultaneously open the alarm, set the alarm for 10 am, after which open
+settings and change the resolution to 720p" becomes:
+
+    lane 1: open chrome → go to youtube and play rick roll → move to the next video
+    lane 2: open the alarm → set the alarm for 10 am → open settings → change the resolution to 720p
+
+* "then", "after which", "after that", "and <verb>" … continue the current lane (in order).
+* "simultaneously", "at the same time", "meanwhile", "in parallel", "and also" start a new lane.
+* "go to <site> and play/search X" stays one step.
+Lanes run concurrently; steps inside a lane run in order and stop on failure.
+Browser navigation after "open <browser>" in the same lane uses that browser.
+The same splitter drives live voice (core/streaming.py): a clause is "closed"
+as soon as the connector after it and the next word have been heard.
+"""
 import re
+import threading
 import time
-from typing import List, Dict, Tuple, Optional
-from datetime import datetime, timedelta
-from skills.screen_automation import process_automation_command
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
+
+from core.logging_setup import get_logger
+
+log = get_logger("jarvis.steps")
+
+VERBS = (r"open|launch|start|close|quit|exit|type|write|save|create|make|search|google|play|pause|resume|stop|"
+         r"go to|go|navigate to|visit|browse to|take|click|double click|press|hit|set|remind|turn|lock|show|tell|"
+         r"send|check|find|rename|delete|copy|move|wait|mute|unmute|minimi[sz]e|maximi[sz]e|scroll|read|list|"
+         r"what|remember|change|switch|adjust|increase|decrease|raise|lower|enable|disable|skip|next|shut ?down|"
+         r"restart|put|mute|unmute|select|download|install|call|email|message|schedule|cancel")
+_PAR = r"(?:and\s+)?(?:simultaneously|at the same time|meanwhile|in parallel|parallelly)(?:\s+and)?"
+_SEQ = (r"(?:and\s+)?(?:then|after which|after that|afterwards|after this|followed by|once (?:that'?s|that is|it'?s) done)"
+        r"(?:\s+and)?")
+_CONNECTOR = re.compile(
+    rf"\s*(?:,|;)?\s*\b(?P<par>{_PAR})\b\s*,?\s*"
+    rf"|\s*(?:,|;)?\s*\b(?P<seq>{_SEQ})\b\s*,?\s*"
+    rf"|\s*(?P<also>\band also\b)\s+(?=(?:{VERBS})\b)"
+    rf"|\s*;\s*|\s*,\s*(?:and\s+)?(?=(?:{VERBS})\b)"
+    rf"|\s+\band\b\s+(?=(?:{VERBS})\b)", re.I)
+_QUESTION = re.compile(r"^(?:how|what|what's|whats|why|when|where|who|whom|which|is|are|can|could|would|should|do|does|"
+                       r"did|explain|describe|tell me about|tell me how|give me)\b", re.I)
+_STRONG_VERBS = r"open|launch|close|play|pause|set|turn|lock|mute|unmute|take|remind|start|go to|shut ?down|restart"
+_AND_STRONG = re.compile(rf"\s+\band\b\s+(?=(?:{_STRONG_VERBS})\b)", re.I)
+_SITE_NAV = re.compile(r"^(?:go to|open|visit|navigate to|browse to)\s+(?:the\s+)?(youtube(?: music)?|google|amazon|reddit|"
+                       r"wikipedia|github|netflix|twitch|spotify web|[\w-]+\.\w{2,}\S*)(?:\s+website)?$", re.I)
+_SITE_FOLLOW = re.compile(r"^(?:play|search(?: for)?|watch|find|look up|listen to|show me)\b", re.I)
+_KEEP_WHOLE = re.compile(r"screen ?shot.*\b(?:tell|describe|what|analy[sz]e|explain|read)\b", re.I)
+_WAIT = re.compile(r"^(?:wait|pause)(?: for)? (\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?)$", re.I)
+_BROWSER = re.compile(r"^(?:open|launch|start)\s+(?:the\s+)?(?:google\s+)?(chrome|edge|microsoft edge|firefox|brave|opera)"
+                      r"(?:\s+browser)?$", re.I)
+_LEAD = re.compile(r"^(?:please|jarvis|hey jarvis|can you|could you|okay|ok)[,\s]+", re.I)
+
+
+@dataclass
+class Step:
+    text: str
+    kind: str = "command"      # "command" or "wait"
+    seconds: float = 0.0
+    intent: str = ""
+    lane: int = 0
+
+
+@dataclass
+class Plan:
+    original: str
+    steps: List[Step] = field(default_factory=list)
+
+    @property
+    def lanes(self) -> Dict[int, List[Step]]:
+        out: Dict[int, List[Step]] = {}
+        for step in self.steps:
+            out.setdefault(step.lane, []).append(step)
+        return out
+
+    def describe(self) -> str:
+        lanes = self.lanes
+        lines = [f"Plan for: {self.original}"]
+        n = 0
+        for lane, steps in lanes.items():
+            if len(lanes) > 1:
+                lines.append(f"Lane {lane + 1}" + (" (runs in parallel)" if lane else ""))
+            for step in steps:
+                n += 1
+                label = f"wait {step.seconds:g} seconds" if step.kind == "wait" else step.text
+                lines.append(f"  {n}. {label}" + (f"   [{step.intent}]" if step.intent else ""))
+        return "\n".join(lines)
+
+
+_STARTS_WITH_VERB = re.compile(rf"^(?:please\s+)?(?:{VERBS})\b", re.I)
+_IMPLICIT = re.compile(
+    r"\s+(?=(?:set|open|close|launch|start|play|change|turn|take|search|remind|lock|mute|unmute|type|press|show|"
+    r"increase|decrease|switch|minimi[sz]e|maximi[sz]e)\s+(?:the|a|an|my|this|that|volume|brightness|alarm|"
+    r"timer|reminder|screen|resolution|it|me)\b|go to\s)", re.I)
+
+
+_LITERAL = re.compile(r"^(?:please\s+)?(?:type|write|say|dictate)\b", re.I)   # the rest is text, not commands
+_INFINITIVE = re.compile(r"\b(?:to|how|want|wants|need|needs|and|or)\s*$", re.I)
+_REMIND = re.compile(r"^(?:please\s+)?(?:remind me|set (?:a|an) reminder|add (?:a|an) reminder)\b", re.I)
+_HAS_TIME = re.compile(r"\b(?:in \d+|at \d|at (?:noon|midnight)|tomorrow|tonight|today|every|on (?:mon|tue|wed|thu|fri|sat|sun))",
+                       re.I)
+
+
+def _implicit_split(clause: str) -> List[str]:
+    """Split "open the alarm set the alarm for 10 am" at a second imperative verb."""
+    if not _STARTS_WITH_VERB.match(clause) or _SITE_NAV.match(clause) or _LITERAL.match(clause) \
+            or _REMIND.match(clause):
+        return [clause]
+    parts, start = [], 0
+    for m in _IMPLICIT.finditer(clause):
+        if m.start() - start < 4:          # need a real object between the verbs
+            continue
+        if _INFINITIVE.search(clause[start:m.start()]):
+            continue                       # "search for how to open a jar": the verb is an object
+        head = clause[start:m.start()].strip()
+        if len(head.split()) >= 2:
+            parts.append(head)
+            start = m.end()
+    parts.append(clause[start:].strip())
+    return [p for p in parts if p]
+
+
+_SITE_NAMES = ("youtube", "google", "github", "netflix", "reddit", "amazon", "spotify", "wikipedia",
+               "twitch", "gmail", "whatsapp", "instagram", "facebook", "linkedin")
+_SITE_SPOKEN = {"you tube": "youtube", "u tube": "youtube", "utube": "youtube", "git hub": "github",
+                "net flix": "netflix", "what's app": "whatsapp", "whats app": "whatsapp", "g mail": "gmail",
+                "linked in": "linkedin", "insta gram": "instagram"}
+_NAV_BEFORE_SITE = re.compile(r"\b(?:go to|open|visit|navigate to|browse to|take me to|on|in|search)\s+(?:the\s+)?$", re.I)
+
+
+def normalize_site_names(text: str) -> str:
+    """Fix misheard / mistyped site names right after a navigation word.
+
+    "go to the yputube and play …" → "go to the youtube and play …". Only a word
+    that follows "go to / open / visit / on …" is touched, and only when it is
+    one or two letters away from a known site, so ordinary words are left alone.
+    """
+    if not text:
+        return text
+    import difflib
+    for spoken, site in _SITE_SPOKEN.items():
+        text = re.sub(rf"\b{re.escape(spoken)}\b", site, text, flags=re.I)
+    out, last = [], 0
+    for m in re.finditer(r"[A-Za-z']+", text):
+        word = m.group(0)
+        low = word.lower()
+        # Only the last few words before this one matter; searching the whole prefix made long
+        # dictation quadratic (40 KB took seconds).
+        if len(low) >= 5 and low not in _SITE_NAMES and \
+                _NAV_BEFORE_SITE.search(text[max(0, m.start() - 40):m.start()]):
+            best = difflib.get_close_matches(low, _SITE_NAMES, n=1, cutoff=0.8)
+            if best and abs(len(best[0]) - len(low)) <= 2:
+                out.append(text[last:m.start()])
+                out.append(best[0])
+                last = m.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
+def split_clauses(text: str) -> List[Tuple[str, str]]:
+    """Split into [(link, clause)] where link is 'start', 'seq' or 'par'."""
+    # Long space runs make the connector pattern's "\s*,?\s*" backtrack cubically (a pasted page froze the
+    # worker); one space / one line break means the same to every rule below.
+    text = re.sub(r"\s*\n\s*", "\n", re.sub(r"[^\S\n]+", " ", (text or "").strip()))
+    text = normalize_site_names(_LEAD.sub("", text.rstrip(".!?")))
+    # Speech arrives in pieces: drop a dangling connector at either end ("…and", "and then go…").
+    text = re.sub(r"\s+(?:and then|and also|and|then|also|after which|after that|simultaneously|"
+                  r"at the same time|meanwhile)$", "", text, flags=re.I)
+    lead = re.match(r"^(?:and then|and|then|after which|after that|afterwards)\s+", text, re.I)
+    if lead:
+        text = text[lead.end():]
+    if not text or re.fullmatch(r"(?:and|then|also|and then|and also)", text, re.I):
+        return []                      # only a connector was heard ("and then")
+    if _KEEP_WHOLE.search(text) and not _CONNECTOR.search(text.split(" and ", 1)[-1]):
+        return [("start", text)]
+    out: List[Tuple[str, str]] = []
+    link, pos = "start", 0
+    question = bool(_QUESTION.match(text))
+    for m in _CONNECTOR.finditer(text):
+        if question and not (m.group("par") or m.group("seq") or m.group("also")):
+            # "how do I open a file and read it" is one question; only split before a clear command.
+            if not _AND_STRONG.match(text, m.start()) and "," not in m.group(0) and ";" not in m.group(0):
+                continue
+        if not (m.group("par") or m.group("seq") or m.group("also")) and "," not in m.group(0) \
+                and ";" not in m.group(0):
+            current = text[pos:m.start()]
+            if _REMIND.match(current.strip(" ,;")) and not _HAS_TIME.search(current):
+                # "remind me to take the trash out and lock the door" is one reminder.
+                continue
+        clause = text[pos:m.start()].strip(" ,;")
+        if clause:
+            out.append((link, clause))
+            link = "seq"
+        link = "par" if m.group("par") or m.group("also") else "seq"
+        pos = m.end()
+    tail = text[pos:].strip(" ,;")
+    if tail:
+        out.append((link, tail))
+    if lead and out and out[0][0] == "start":
+        out[0] = ("seq", out[0][1])
+    # Spoken commands often have no connector at all: "open the alarm set the alarm for 10 am".
+    expanded: List[Tuple[str, str]] = []
+    for link, clause in out:
+        parts = [clause] if _QUESTION.match(clause) else _implicit_split(clause)
+        expanded.append((link, parts[0]))
+        expanded.extend(("seq", p) for p in parts[1:])
+    out = expanded
+    # Re-join "go to youtube" + "play X" into one browser action.
+    merged: List[Tuple[str, str]] = []
+    for link, clause in out:
+        if merged and link == "seq" and _SITE_NAV.match(merged[-1][1]) and _SITE_FOLLOW.match(clause):
+            merged[-1] = (merged[-1][0], f"{merged[-1][1]} and {clause}")
+        else:
+            merged.append((link, clause))
+    return merged
+
 
 class CommandProcessor:
-    def __init__(self, jarvis_instance):
-        """Initialize with reference to main JARVIS instance"""
+    def __init__(self, jarvis_instance=None):
         self.jarvis = jarvis_instance
-        
-        # Command patterns for complex parsing
-        self.sequence_patterns = [
-            r"(.*?)\s*(?:then|and then|after that|next)\s*(.*)",
-            r"(.*?)\s*(?:,\s*then|,\s*and then)\s*(.*)",
-            r"(.*?)\s*(?:;\s*then|;\s*and)\s*(.*)",
-        ]
-        
-        # Time delay patterns
-        self.delay_patterns = [
-            r"wait\s+(\d+)\s+seconds?",
-            r"pause\s+for\s+(\d+)\s+seconds?",
-            r"after\s+(\d+)\s+seconds?",
-            r"in\s+(\d+)\s+seconds?",
-        ]
-        
-        # Conditional patterns
-        self.conditional_patterns = [
-            r"if\s+(.*?)\s+then\s+(.*)",
-            r"when\s+(.*?)\s+(?:then\s+)?(.*)",
-            r"once\s+(.*?)\s+(?:then\s+)?(.*)",
-        ]
-        
-        # Automation patterns including complex multi-step tasks
-        self.automation_patterns = [
-            r"automate\s+(.*)",
-            r"auto\s+(.*)",
-            r"screen\s+(.*)",
-            r"ai\s+help\s+with\s+(.*)",
-            r"click\s+(?:on\s+)?(?:the\s+)?(.*)",
-            r"find\s+and\s+click\s+(?:on\s+)?(?:the\s+)?(.*)",
-            r"locate\s+and\s+click\s+(?:on\s+)?(?:the\s+)?(.*)",
-            r"press\s+(?:on\s+)?(?:the\s+)?(.*)",
-            r"tap\s+(?:on\s+)?(?:the\s+)?(.*)",
-        ]
-        
-        # Complex task patterns - high-level automation
-        self.complex_task_patterns = [
-            r"set\s+(?:an?\s+)?alarm\s+(?:for\s+|at\s+)?(.+)",
-            r"(?:wake\s+me\s+up|alarm)\s+(?:at\s+|in\s+|for\s+)(.+)",
-            r"send\s+(?:an?\s+)?email\s+(?:to\s+)?(.+)",
-            r"(?:compose|write)\s+(?:an?\s+)?email\s+(?:to\s+)?(.+)",
-            r"set\s+(?:a\s+)?reminder\s+(?:to\s+)?(.+)",
-            r"remind\s+me\s+(?:to\s+)?(.+)",
-            r"set\s+(?:a\s+)?timer\s+(?:for\s+)?(.+)",
-            r"(?:start|begin)\s+(?:a\s+)?timer\s+(?:for\s+)?(.+)",
-            r"(?:open|go\s+to|navigate\s+to|visit)\s+(?:website\s+)?(.+\.(?:com|org|net|edu|io|co\.uk))",
-            r"(?:create|make|write)\s+(?:a\s+|new\s+)?document\s+(?:about\s+|with\s+|containing\s+)?(.+)",
-            r"take\s+(?:a\s+)?screenshot",
-            r"(?:capture|snip)\s+(?:the\s+)?screen",
-        ]
-        
-        # File operation context
-        self.file_context = {}
-        
-    def parse_complex_command(self, command: str) -> List[Dict]:
-        """Parse complex commands into executable steps"""
-        steps = []
-        
-        # Check for complex multi-step tasks first
-        complex_task_match = self._match_pattern(command, self.complex_task_patterns)
-        if complex_task_match:
-            task_details = complex_task_match[0] if isinstance(complex_task_match, tuple) else complex_task_match
-            steps.append({
-                'type': 'complex_task',
-                'task_details': task_details,
-                'raw_command': command
-            })
-            return steps
-        
-        # Check for automation commands
-        automation_match = self._match_pattern(command, self.automation_patterns)
-        if automation_match:
-            automation_goal = automation_match[0] if isinstance(automation_match, tuple) else automation_match
-            steps.append({
-                'type': 'automation',
-                'goal': automation_goal,
-                'raw_command': command
-            })
-            return steps
-        
-        # Check for conditional commands
-        conditional_match = self._match_pattern(command, self.conditional_patterns)
-        if conditional_match:
-            condition, action = conditional_match
-            steps.append({
-                'type': 'conditional',
-                'condition': condition.strip(),
-                'action': action.strip(),
-                'raw_command': command
-            })
-            return steps
-        
-        # Check for sequence commands
-        sequence_match = self._match_pattern(command, self.sequence_patterns)
-        if sequence_match:
-            first_part, second_part = sequence_match
-            
-            # Parse first part
-            first_steps = self._parse_single_command(first_part.strip())
-            steps.extend(first_steps)
-            
-            # Check for delays in second part
-            delay_match = self._match_pattern(second_part, self.delay_patterns)
-            if delay_match:
-                delay_seconds = int(delay_match[0])
-                steps.append({
-                    'type': 'delay',
-                    'seconds': delay_seconds,
-                    'raw_command': f"wait {delay_seconds} seconds"
-                })
-                # Remove delay from second part
-                second_part = re.sub(r'wait\s+\d+\s+seconds?', '', second_part).strip()
-                second_part = re.sub(r'pause\s+for\s+\d+\s+seconds?', '', second_part).strip()
-            
-            # Parse second part if there's anything left
-            if second_part:
-                second_steps = self._parse_single_command(second_part)
-                steps.extend(second_steps)
-            
-            return steps
-        
-        # Single command
-        steps.extend(self._parse_single_command(command))
-        return steps
-    
-    def _match_pattern(self, text: str, patterns: List[str]) -> Optional[Tuple]:
-        """Match text against multiple patterns"""
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return match.groups()
-        return None
-    
-    def _parse_single_command(self, command: str) -> List[Dict]:
-        """Parse a single command into actionable steps"""
-        command = command.strip()
-        
-        # File creation with content
-        if self._is_file_creation_with_content(command):
-            return self._parse_file_creation_command(command)
-        
-        # Application automation sequences
-        if self._is_app_automation_sequence(command):
-            return self._parse_app_automation_sequence(command)
-        
-        # System automation sequences
-        if self._is_system_automation_sequence(command):
-            return self._parse_system_automation_sequence(command)
-        
-        # Default single command
-        return [{
-            'type': 'simple',
-            'command': command,
-            'raw_command': command
-        }]
-    
-    def _is_file_creation_with_content(self, command: str) -> bool:
-        """Check if command is about creating files with specific content"""
-        file_keywords = ['create', 'make', 'write', 'generate']
-        content_keywords = ['about', 'containing', 'with content', 'text about']
-        
-        has_file_keyword = any(keyword in command.lower() for keyword in file_keywords)
-        has_content_keyword = any(keyword in command.lower() for keyword in content_keywords)
-        
-        return has_file_keyword and has_content_keyword
-    
-    def _parse_file_creation_command(self, command: str) -> List[Dict]:
-        """Parse file creation commands with content generation.
-        Robustly extracts filename, optional location, and topic.
-        """
-        steps = []
 
-        text = command.strip()
-        lower = text.lower()
+    @staticmethod
+    def split_steps(command: str) -> List[str]:
+        return [clause for _, clause in split_clauses(command)]
 
-        # Extract a topic: prefer "write about X" then generic "about X"
-        topic = None
-        m_topic = re.search(r"write\s+about\s+(.+)", lower, re.IGNORECASE)
-        if m_topic:
-            topic = m_topic.group(1).strip()
-        elif " about " in lower:
-            topic = lower.split(" about ", 1)[1].strip()
-
-        # Trim trailing phrases from topic (e.g., "and save as ...", locations, filename specs)
-        if topic:
-            topic = re.split(
-                r"\b(?:and\s+save(?:\s+it)?\s+as|save\s+as|named|called|name\s+it|call\s+it|in\s+this\s+folder|on\s+this\s+folder|in\s+folder|on\s+folder|on\s+desktop|in\s+desktop|here|with\s+name|file\s+name|filename)\b",
-                topic,
-                1,
-                flags=re.IGNORECASE,
-            )[0].strip(" .,;")
-
-        # Extract filename via multiple patterns with non-greedy + lookahead to stop at conjunctions/locations
-        filename = None
-        filename_patterns = [
-            r"(?:named|called|name\s+it|call\s+it)\s+([\w\-. ]+?)(?=\s+(?:on|in|and|with|write|save)\b|$)",
-            r"save\s+(?:it\s+)?as\s+([\w\-. ]+?)(?=\s+(?:on|in|and|with|write)\b|$)",
-            r"create\s+(?:a\s+)?file\s+([\w\-. ]+?)(?=\s+(?:on|in|and|with|write|called|named)\b|$)",
-        ]
-        for pat in filename_patterns:
-            m = re.search(pat, lower, re.IGNORECASE)
+    def plan(self, command: str, classify: Optional[Callable[[str], str]] = None) -> Plan:
+        plan = Plan(command)
+        lane = 0
+        for link, chunk in split_clauses(command):
+            if link == "par" and plan.steps:
+                lane = max(s.lane for s in plan.steps) + 1
+            m = _WAIT.match(chunk)
             if m:
-                filename = m.group(1).strip().strip('\"\'')
-                break
-
-        # Clean filename of location or extra chatter and ensure extension
-        if filename:
-            filename = re.split(r"\b(?:in|on)\s+(?:this|the)\s+folder\b", filename, 1, flags=re.IGNORECASE)[0]
-            filename = re.split(r"\b(?:on|in)\s+desktop\b", filename, 1, flags=re.IGNORECASE)[0]
-            filename = re.split(r"\band\s+write\b", filename, 1, flags=re.IGNORECASE)[0]
-            filename = filename.replace(" here", "").replace(" in here", "").strip()
-
-        # Ensure txt extension by default
-        if filename and not filename.lower().endswith((".txt", ".md", ".log", ".csv")):
-            if "." not in filename:
-                filename += ".txt"
-
-        # Fallback filename from topic
-        if not filename and topic:
-            safe = re.sub(r"[^a-z0-9_\-]+", "_", topic.lower()).strip("_")
-            filename = (safe[:30] or "untitled") + ".txt"
-
-        # Detect location keywords
-        location = None
-        if any(kw in lower for kw in ["on desktop", "to desktop", "onto desktop", "in desktop"]):
-            location = "desktop"
-
-        if topic and filename:
-            steps.append(
-                {
-                    "type": "file_creation_with_content",
-                    "topic": topic,
-                    "filename": filename,
-                    "location": location,
-                    "raw_command": command,
-                }
-            )
-
-        return steps
-    
-    def _is_app_automation_sequence(self, command: str) -> bool:
-        """Check if command involves app automation"""
-        app_keywords = ['open', 'launch', 'start']
-        automation_keywords = ['type', 'click', 'press', 'calculate', 'enter']
-        
-        has_app = any(keyword in command.lower() for keyword in app_keywords)
-        has_automation = any(keyword in command.lower() for keyword in automation_keywords)
-        
-        return has_app and has_automation
-    
-    def _parse_app_automation_sequence(self, command: str) -> List[Dict]:
-        """Parse application automation sequences"""
-        steps = []
-        
-        # Common patterns
-        if "calculator" in command.lower() and any(calc in command.lower() for calc in ["2+2", "calculate", "type"]):
-            steps.extend([
-                {'type': 'simple', 'command': 'launch calculator', 'raw_command': 'launch calculator'},
-                {'type': 'delay', 'seconds': 2, 'raw_command': 'wait for app to load'},
-                {'type': 'simple', 'command': 'type 2+2', 'raw_command': 'type 2+2'},
-                {'type': 'simple', 'command': 'press enter', 'raw_command': 'press enter'}
-            ])
-        
-        elif "notepad" in command.lower() and "type" in command.lower():
-            # Extract text to type
-            type_match = re.search(r'type\s+"([^"]+)"', command)
-            if not type_match:
-                type_match = re.search(r'type\s+(.+?)(?:\s+in|\s+into|$)', command)
-            
-            text_to_type = type_match.group(1) if type_match else "Hello, JARVIS!"
-            
-            steps.extend([
-                {'type': 'simple', 'command': 'launch notepad', 'raw_command': 'launch notepad'},
-                {'type': 'delay', 'seconds': 2, 'raw_command': 'wait for app to load'},
-                {'type': 'simple', 'command': f'type {text_to_type}', 'raw_command': f'type {text_to_type}'}
-            ])
-        
-        return steps
-    
-    def _is_system_automation_sequence(self, command: str) -> bool:
-        """Check if command involves system automation"""
-        system_keywords = ['screenshot', 'volume', 'brightness']
-        automation_keywords = ['then', 'and', 'after']
-        
-        has_system = any(keyword in command.lower() for keyword in system_keywords)
-        has_sequence = any(keyword in command.lower() for keyword in automation_keywords)
-        
-        return has_system and has_sequence
-    
-    def _parse_system_automation_sequence(self, command: str) -> List[Dict]:
-        """Parse system automation sequences"""
-        steps = []
-        
-        if "screenshot" in command.lower():
-            steps.append({'type': 'simple', 'command': 'take screenshot', 'raw_command': 'take screenshot'})
-        
-        if "volume" in command.lower():
-            volume_match = re.search(r'volume\s+(?:to\s+)?(\d+)', command)
-            if volume_match:
-                volume = volume_match.group(1)
-                steps.append({'type': 'simple', 'command': f'set volume {volume}', 'raw_command': f'set volume {volume}'})
-        
-        return steps
-    
-    def execute_parsed_commands(self, steps: List[Dict], use_voice: bool = True) -> List[str]:
-        """Execute a list of parsed command steps"""
-        results = []
-        
-        for i, step in enumerate(steps):
-            try:
-                if step['type'] == 'delay':
-                    self._execute_delay(step, use_voice)
-                    results.append(f"Waited {step['seconds']} seconds")
-                
-                elif step['type'] == 'conditional':
-                    result = self._execute_conditional(step, use_voice)
-                    results.append(result)
-                
-                elif step['type'] == 'file_creation_with_content':
-                    result = self._execute_file_creation_with_content(step, use_voice)
-                    results.append(result)
-                
-                elif step['type'] == 'automation':
-                    result = self._execute_automation(step, use_voice)
-                    results.append(result)
-                
-                elif step['type'] == 'complex_task':
-                    result = self._execute_complex_task(step, use_voice)
-                    results.append(result)
-                
-                elif step['type'] == 'simple':
-                    # Use existing JARVIS command processing
-                    self.jarvis.process_command(step['command'], use_voice=False)
-                    results.append(f"Executed: {step['command']}")
-                
-                # Small delay between commands for stability
-                if i < len(steps) - 1:
-                    time.sleep(0.5)
-                    
-            except Exception as e:
-                error_msg = f"Error executing step '{step.get('raw_command', step)}': {e}"
-                results.append(error_msg)
+                seconds = float(m.group(1)) * (60 if m.group(2).lower().startswith("m") else 1)
+                plan.steps.append(Step(chunk, "wait", min(seconds, 600), lane=lane))
                 continue
-        
+            step = Step(chunk, lane=lane)
+            if classify:
+                try:
+                    step.intent = classify(chunk)
+                except Exception:
+                    step.intent = ""
+            plan.steps.append(step)
+        return plan
+
+    @staticmethod
+    def is_browser_launch(text: str) -> Optional[str]:
+        m = _BROWSER.match(text.strip())
+        return m.group(1).lower() if m else None
+
+    def execute(self, plan: Plan, run_step: Callable[[str, dict], str],
+                should_stop: Optional[Callable[[], bool]] = None,
+                on_progress: Optional[Callable[[int, int, str], None]] = None,
+                settle: Optional[Callable[[str, str, dict], None]] = None,
+                on_event=None) -> List[str]:
+        """Run lanes concurrently (steps within a lane in order). Returns replies in plan order."""
+        from core.executor import ExecutionSession
+        total = len(plan.steps)
+
+        def events(kind, info):
+            if kind == "step_started" and on_progress:
+                on_progress(info["index"] + 1, total, info["text"])
+            if on_event:
+                on_event(kind, info)
+
+        default_settle = settle or (lambda text, reply, ctx: time.sleep(1.5) if self.is_browser_launch(text) else None)
+
+        def step_runner(text, context):
+            reply = run_step(text, context)
+            browser = self.is_browser_launch(text)
+            if browser:
+                context["browser"] = browser
+            return reply
+
+        session = ExecutionSession(step_runner, default_settle, events)
+        watcher = None
+        if should_stop:
+            def watch():
+                while not session.stopped.is_set() and session.busy is not False:
+                    if should_stop():
+                        session.stop()
+                        return
+                    time.sleep(0.1)
+            watcher = threading.Thread(target=watch, daemon=True)
+        last_lane = 0
+        for step in plan.steps:
+            session.submit(step.text, parallel=step.lane != last_lane, kind=step.kind, seconds=step.seconds)
+            last_lane = step.lane
+        if watcher:
+            watcher.start()
+        results = session.close_and_wait()
+        session.stopped.set()
         return results
-    
-    def _execute_delay(self, step: Dict, use_voice: bool):
-        """Execute a delay step"""
-        seconds = step['seconds']
-        if use_voice:
-            self.jarvis.voice_engine.speak(f"Waiting {seconds} seconds")
-        time.sleep(seconds)
-    
-    def _execute_conditional(self, step: Dict, use_voice: bool) -> str:
-        """Execute a conditional step (simplified implementation)"""
-        condition = step['condition']
-        action = step['action']
-        
-        # Simple condition checking (can be expanded)
-        if "file exists" in condition.lower():
-            filename = condition.lower().replace("file exists", "").replace("if", "").strip()
-            if self.jarvis.file_skill.file_exists(filename):
-                self.jarvis.process_command(action, use_voice=False)
-                return f"Condition met, executed: {action}"
-            else:
-                return f"Condition not met: {condition}"
-        
-        # Default: execute action anyway
-        self.jarvis.process_command(action, use_voice=False)
-        return f"Executed conditional action: {action}"
-    
-    def _execute_file_creation_with_content(self, step: Dict, use_voice: bool) -> str:
-        """Execute file creation with AI-generated content"""
-        topic = step['topic']
-        filename = step['filename']
-        location = step.get('location')
 
-        # Generate content using available brain (prefer multi-model, then OpenRouter, then native)
-        content_request = (
-            f"Write a clear, well-structured article about {topic}. Include a short intro, 3-5 bullet points, and a concise conclusion."
-        )
-
-        try:
-            if getattr(self.jarvis, 'use_multi_model', False) and getattr(self.jarvis, 'multi_brain', None):
-                content = self.jarvis.multi_brain.process_command(content_request)
-            elif getattr(self.jarvis, 'use_advanced_brain', False) and getattr(self.jarvis, 'openrouter_brain', None):
-                content = self.jarvis.openrouter_brain.process_command(content_request)
-            else:
-                raise RuntimeError("advanced brain unavailable")
-        except Exception:
-            content = (
-                f"# {topic.title()}\n\n"
-                f"Created by JARVIS on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                f"Key points about {topic}:\n"
-                f"- Overview paragraph explaining the topic in simple terms.\n"
-                f"- 3–5 bullet points with important facts.\n"
-                f"- Short conclusion summarizing why it matters.\n"
-            )
-
-        # Create the file in the right place
-        if location == 'desktop':
-            result = self.jarvis.file_skill.create_file_at_location(filename, content, location='desktop')
-        else:
-            result = self.jarvis.file_skill.create_file(filename, content)
-
-        # Update last created file reference
-        self.jarvis.last_created_file = filename
-
-        return result
-    
-    def _execute_automation(self, step: Dict, use_voice: bool) -> str:
-        """Execute automation step using screen automation"""
-        goal = step['goal']
-        raw_command = step.get('raw_command', '')
-        
-        try:
-            # Import screen automation for direct access
-            from skills.screen_automation import ScreenAutomationSkill
-            automation = ScreenAutomationSkill(self.jarvis)
-            
-            if use_voice:
-                self.jarvis.voice_engine.speak(f"Starting automation for: {goal}")
-            
-            # Check if this is a specific click command
-            click_patterns = [
-                r"click\s+(?:on\s+)?(?:the\s+)?(.*)",
-                r"find\s+and\s+click\s+(?:on\s+)?(?:the\s+)?(.*)",
-                r"locate\s+and\s+click\s+(?:on\s+)?(?:the\s+)?(.*)",
-                r"press\s+(?:on\s+)?(?:the\s+)?(.*)",
-                r"tap\s+(?:on\s+)?(?:the\s+)?(.*)",
-            ]
-            
-            # Check for click commands
-            for pattern in click_patterns:
-                match = re.search(pattern, raw_command.lower())
-                if match:
-                    element_name = match.group(1).strip()
-                    if use_voice:
-                        self.jarvis.voice_engine.speak(f"Looking for {element_name}")
-                    
-                    # Use the enhanced find and click functionality
-                    result = automation.find_and_click_element(element_name)
-                    
-                    if result.get('success', False):
-                        coords = result.get('coordinates', [])
-                        confidence = result.get('confidence', 0)
-                        success_msg = f"Successfully clicked {element_name} at {coords} (confidence: {confidence:.2f})"
-                        
-                        if use_voice:
-                            self.jarvis.voice_engine.speak(f"Successfully clicked {element_name}")
-                        
-                        return success_msg
-                    else:
-                        error_msg = result.get('message', f"Could not find {element_name}")
-                        if use_voice:
-                            self.jarvis.voice_engine.speak(f"Could not find {element_name}")
-                        return error_msg
-            
-            # For other automation commands, use the general automation system
-            result = process_automation_command(f"automate {goal}", self.jarvis)
-            
-            if use_voice:
-                self.jarvis.voice_engine.speak("Automation completed")
-            
-            return result
-            
-        except Exception as e:
-            error_msg = f"Automation failed: {str(e)}"
-            if use_voice:
-                self.jarvis.voice_engine.speak("Automation failed")
-            return error_msg
-    
-    def _execute_complex_task(self, step: Dict, use_voice: bool) -> str:
-        """Execute a complex multi-step task"""
-        try:
-            from skills.visual_task_orchestrator import process_visual_task
-            
-            raw_command = step['raw_command']
-            result = process_visual_task(raw_command)
-            
-            if use_voice:
-                # Provide brief voice feedback
-                if "✅" in result:
-                    self.jarvis.voice_engine.speak("Complex task completed successfully")
-                else:
-                    self.jarvis.voice_engine.speak("Complex task encountered an issue")
-            
-            return result
-            
-        except Exception as e:
-            error_msg = f"Complex task failed: {str(e)}"
-            if use_voice:
-                self.jarvis.voice_engine.speak("Complex task failed")
-            return error_msg
-    
-    def get_command_suggestions(self, partial_command: str) -> List[str]:
-        """Get command suggestions based on partial input"""
-        suggestions = []
-        
-        # Common compound command patterns
-        compound_patterns = [
-            "take screenshot then open calculator and type 2+2",
-            "create a file about robotics and save it as robotics_info.txt",
-            "open notepad then type 'Hello World' and save the file",
-            "get system status then take screenshot",
-            "search for weather then take screenshot of results",
-            "create folder called 'projects' then create file inside it",
-            "launch calculator, wait 2 seconds, then type 5*5",
-            "if file exists data.txt then read it, otherwise create it",
-            "automate opening calculator and calculating 5+5",
-            "automate clicking on the start menu",
-            "automate taking a screenshot and saving it",
-            "ai help with opening browser and searching for news",
-            "screen automation to close all windows",
-            "auto navigate to website and fill form",
-            # Complex task suggestions
-            "set alarm for 7:30 AM",
-            "send email to john@example.com subject meeting reminder",
-            "set reminder to call mom in 2 hours",
-            "set timer for 10 minutes",
-            "create document about artificial intelligence",
-            "take screenshot",
-            "open website google.com"
-        ]
-        
-        # Filter suggestions based on partial command
-        partial_lower = partial_command.lower()
-        for pattern in compound_patterns:
-            if any(word in pattern.lower() for word in partial_lower.split() if len(word) > 2):
-                suggestions.append(pattern)
-        
-        return suggestions[:5]  # Return top 5 suggestions
+    # Backwards-compatible name used by older code.
+    def parse_complex_command(self, command: str):
+        return [{"type": s.kind, "command": s.text, "seconds": s.seconds, "lane": s.lane}
+                for s in self.plan(command).steps]

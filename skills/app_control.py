@@ -1,551 +1,558 @@
-import subprocess
-import os
-import time
-import psutil
-import winreg
-from pathlib import Path
+"""Open and close applications and websites on Windows.
+
+Launching goes through the Windows shell (``os.startfile`` / ShellExecute),
+which resolves registered "App Paths" (chrome.exe, winword.exe …), protocol
+URIs (ms-settings:, spotify:) and Start-menu shortcuts without ever passing
+user text to a command interpreter.
+"""
 import json
+import os
+import re
+import subprocess
+import threading
+import time
+import webbrowser
+from pathlib import Path
+from urllib.parse import quote_plus
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None
+
+try:
+    import winreg
+except ImportError:  # non-Windows
+    winreg = None
+
+from core.logging_setup import get_logger
+
+log = get_logger("jarvis.apps")
+
+# Common site keywords → canonical URLs
+_SITE_MAP = {
+    "youtube": "https://www.youtube.com",
+    "youtube music": "https://music.youtube.com",
+    "google": "https://www.google.com",
+    "gmail": "https://mail.google.com",
+    "google drive": "https://drive.google.com",
+    "google docs": "https://docs.google.com",
+    "google maps": "https://maps.google.com",
+    "maps": "https://maps.google.com",
+    "google translate": "https://translate.google.com",
+    "facebook": "https://www.facebook.com",
+    "instagram": "https://www.instagram.com",
+    "twitter": "https://x.com",
+    "x": "https://x.com",
+    "reddit": "https://www.reddit.com",
+    "netflix": "https://www.netflix.com",
+    "prime video": "https://www.primevideo.com",
+    "amazon": "https://www.amazon.com",
+    "flipkart": "https://www.flipkart.com",
+    "github": "https://github.com",
+    "stack overflow": "https://stackoverflow.com",
+    "stackoverflow": "https://stackoverflow.com",
+    "linkedin": "https://www.linkedin.com",
+    "wikipedia": "https://www.wikipedia.org",
+    "whatsapp web": "https://web.whatsapp.com",
+    "spotify web": "https://open.spotify.com",
+    "twitch": "https://www.twitch.tv",
+    "discord web": "https://discord.com/app",
+    "chatgpt": "https://chatgpt.com",
+    "claude": "https://claude.ai",
+    "outlook web": "https://outlook.live.com",
+}
+
+# Friendly name → shell target (exe name resolved via App Paths, or a URI).
+_APP_ALIASES = {
+    "notepad": "notepad.exe", "calculator": "calc.exe", "calc": "calc.exe",
+    "paint": "mspaint.exe", "wordpad": "write.exe", "snipping tool": "snippingtool.exe",
+    "cmd": "cmd.exe", "command prompt": "cmd.exe", "terminal": "wt.exe", "windows terminal": "wt.exe",
+    "powershell": "powershell.exe", "explorer": "explorer.exe", "file explorer": "explorer.exe",
+    "files": "explorer.exe", "task manager": "taskmgr.exe", "control panel": "control.exe",
+    "registry editor": "regedit.exe", "device manager": "devmgmt.msc", "disk management": "diskmgmt.msc",
+    "services": "services.msc", "event viewer": "eventvwr.msc",
+    "settings": "ms-settings:", "windows settings": "ms-settings:", "microsoft store": "ms-windows-store:",
+    "store": "ms-windows-store:", "camera": "microsoft.windows.camera:", "clock": "ms-clock:",
+    "alarms": "ms-clock:", "alarm": "ms-clock:", "photos": "ms-photos:", "mail": "outlookmail:",
+    "calendar": "outlookcal:", "maps app": "bingmaps:", "xbox": "xbox:",
+    "chrome": "chrome.exe", "google chrome": "chrome.exe", "firefox": "firefox.exe",
+    "edge": "msedge.exe", "microsoft edge": "msedge.exe", "brave": "brave.exe", "opera": "opera.exe",
+    "vs code": "code", "vscode": "code", "visual studio code": "code",
+    "word": "winword.exe", "microsoft word": "winword.exe", "excel": "excel.exe",
+    "microsoft excel": "excel.exe", "powerpoint": "powerpnt.exe", "outlook": "outlook.exe",
+    "onenote": "onenote.exe", "teams": "ms-teams:", "zoom": "zoommtg:", "spotify": "spotify:",
+    "whatsapp": "whatsapp:", "telegram": "tg:", "discord": "discord:", "steam": "steam:",
+    "vlc": "vlc.exe",
+}
+
+# Friendly name → process image names (for closing apps).
+_PROCESS_NAMES = {
+    "chrome": ["chrome.exe"], "google chrome": ["chrome.exe"], "edge": ["msedge.exe"],
+    "microsoft edge": ["msedge.exe"], "firefox": ["firefox.exe"], "brave": ["brave.exe"],
+    "opera": ["opera.exe"], "notepad": ["notepad.exe"], "calculator": ["calculatorapp.exe", "calc.exe"],
+    "calc": ["calculatorapp.exe", "calc.exe"], "paint": ["mspaint.exe"], "word": ["winword.exe"],
+    "excel": ["excel.exe"], "powerpoint": ["powerpnt.exe"], "outlook": ["outlook.exe", "olk.exe"],
+    "teams": ["ms-teams.exe", "teams.exe"], "spotify": ["spotify.exe"], "discord": ["discord.exe"],
+    "vs code": ["code.exe"], "vscode": ["code.exe"], "visual studio code": ["code.exe"],
+    "steam": ["steam.exe"], "zoom": ["zoom.exe"], "vlc": ["vlc.exe"], "whatsapp": ["whatsapp.exe"],
+    "telegram": ["telegram.exe"], "task manager": ["taskmgr.exe"], "file explorer": [],
+    "terminal": ["windowsterminal.exe"], "windows terminal": ["windowsterminal.exe"],
+}
+BROWSERS = {"chrome": "chrome.exe", "google chrome": "chrome.exe", "edge": "msedge.exe",
+            "microsoft edge": "msedge.exe", "firefox": "firefox.exe", "brave": "brave.exe",
+            "opera": "opera.exe"}
+
+_NAV_PREFIX = re.compile(r"^(?:please\s+)?(?:can you\s+)?(?:go to|navigate to|visit|open website|open the website|"
+                         r"browse to|take me to|open|launch|start|run)\s+", re.I)
+_ACTION = re.compile(r"\b(?:and|then|to)\s+(play|search(?: for)?|find|watch|look up|listen to|stream|show me)\s+(.+)$", re.I)
+_FILLER = re.compile(r"\b(?:the|my|app|application|program|browser|please|for me|now|up)\b", re.I)
+_SAFE_NAME = re.compile(r"[^\w .+&'-]")
+# Extensions that make "name.ext" a file/program rather than a web domain.
+_FILE_EXTS = {"exe", "msc", "lnk", "bat", "cmd", "ps1", "txt", "pdf", "doc", "docx", "xls", "xlsx",
+              "ppt", "pptx", "png", "jpg", "jpeg", "gif", "mp3", "mp4", "mkv", "zip", "py", "csv", "json"}
+
+
+def _word_re(name: str) -> str:
+    """Whole-word pattern that also works for names ending in symbols ('notepad++')."""
+    return rf"(?<!\w){re.escape(name)}(?!\w)"
+
+
+def _icon_path(icon: str) -> str:
+    """'"C:\\a,b\\app.exe",0' → 'C:\\a,b\\app.exe' (drop quotes and the icon index only)."""
+    icon = (icon or "").strip()
+    m = re.match(r'^"([^"]*)"', icon)
+    if m:
+        return m.group(1)
+    return re.sub(r",\s*-?\d+$", "", icon).strip('"')
+
+
+def youtube_first_video(query: str, timeout: float = 6.0):
+    """Return the watch URL of the first YouTube search result, or None."""
+    try:
+        import requests
+        resp = requests.get("https://www.youtube.com/results", params={"search_query": query},
+                            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.8"},
+                            timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        match = re.search(r'"videoRenderer":\{"videoId":"([\w-]{11})"', resp.text) or \
+            re.search(r'/watch\?v=([\w-]{11})', resp.text)
+        return f"https://www.youtube.com/watch?v={match.group(1)}" if match else None
+    except Exception as exc:
+        log.info("YouTube lookup failed: %s", exc)
+        return None
+
 
 class ApplicationControl:
-    def __init__(self):
+    def __init__(self, scan: bool = True):
         self.installed_apps = {}
-        self.refresh_app_list()
-    
+        self._browser_callback = None  # set by the GUI to use the embedded browser
+        self._start_apps = None        # cached Get-StartApps list
+        self._scan_lock = threading.Lock()
+        if scan:
+            threading.Thread(target=self.refresh_app_list, name="AppScan", daemon=True).start()
+
+    def set_browser_callback(self, fn):
+        """Register a callback(url, then_js) that opens URLs in the embedded browser."""
+        self._browser_callback = fn
+
+    # ── Discovery ────────────────────────────────────────────────────────────
+
     def refresh_app_list(self):
-        """Refresh the list of installed applications"""
-        try:
-            self.installed_apps = self._get_installed_applications()
-        except Exception as e:
-            print(f"Error refreshing app list: {e}")
-    
-    def _get_installed_applications(self):
-        """Get list of installed applications from Windows registry"""
-        apps = {}
-        
-        # Registry keys to check for installed programs
-        registry_keys = [
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-        ]
-        
-        for registry_key in registry_keys:
+        with self._scan_lock:
             try:
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, registry_key)
+                self.installed_apps = self._get_installed_applications()
+            except Exception as exc:
+                log.warning("Error refreshing app list: %s", exc)
+        return len(self.installed_apps)
+
+    def _get_installed_applications(self):
+        apps = {}
+        if winreg is None:
+            return apps
+        roots = [(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+                 (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")]
+        for hive, path in roots:
+            try:
+                key = winreg.OpenKey(hive, path)
+            except OSError:
+                continue
+            try:
                 for i in range(winreg.QueryInfoKey(key)[0]):
                     try:
-                        subkey_name = winreg.EnumKey(key, i)
-                        subkey = winreg.OpenKey(key, subkey_name)
-                        
-                        try:
-                            display_name = winreg.QueryValueEx(subkey, "DisplayName")[0]
-                            install_location = None
-                            executable = None
-                            
-                            try:
-                                install_location = winreg.QueryValueEx(subkey, "InstallLocation")[0]
-                            except FileNotFoundError:
-                                pass
-                            
-                            try:
-                                executable = winreg.QueryValueEx(subkey, "DisplayIcon")[0]
-                                if executable and executable.endswith('.exe'):
-                                    executable = executable.split(',')[0]  # Remove icon index
-                            except FileNotFoundError:
-                                pass
-                            
-                            apps[display_name.lower()] = {
-                                'name': display_name,
-                                'location': install_location,
-                                'executable': executable
-                            }
-                        except FileNotFoundError:
-                            pass
-                        
-                        winreg.CloseKey(subkey)
-                    except Exception:
+                        sub = winreg.OpenKey(key, winreg.EnumKey(key, i))
+                    except OSError:
                         continue
-                
+                    try:
+                        name = winreg.QueryValueEx(sub, "DisplayName")[0]
+                    except OSError:
+                        winreg.CloseKey(sub)
+                        continue
+                    location = executable = None
+                    try:
+                        location = winreg.QueryValueEx(sub, "InstallLocation")[0] or None
+                    except OSError:
+                        pass
+                    try:
+                        icon = _icon_path(str(winreg.QueryValueEx(sub, "DisplayIcon")[0]))
+                        if icon.lower().endswith(".exe") and "unins" not in icon.lower():
+                            executable = icon
+                    except OSError:
+                        pass
+                    apps[name.lower()] = {"name": name, "location": location, "executable": executable}
+                    winreg.CloseKey(sub)
+            finally:
                 winreg.CloseKey(key)
+        return apps
+
+    def discover_applications(self) -> str:
+        count = self.refresh_app_list()
+        start = self._get_start_apps(refresh=True)
+        return (f"Found {count} installed programs and {len(start)} Start-menu apps. "
+                f"Say 'open <name>' to launch one, or 'list apps <filter>' to search.")
+
+    def list_installed_apps(self, filter_text=""):
+        names = {v["name"] for v in self.installed_apps.values()}
+        names |= {a["Name"] for a in self._get_start_apps() if a.get("Name")}
+        if filter_text:
+            names = {n for n in names if filter_text.lower() in n.lower()}
+        if not names:
+            return "No applications found matching the filter."
+        ordered = sorted(names, key=str.lower)
+        more = f"\n… and {len(ordered) - 50} more" if len(ordered) > 50 else ""
+        return "Installed applications:\n" + "\n".join(ordered[:50]) + more
+
+    def _get_start_apps(self, refresh: bool = False):
+        """Start-menu apps (incl. Store apps) via PowerShell Get-StartApps, cached."""
+        if self._start_apps is not None and not refresh:
+            return self._start_apps
+        if os.name != "nt":
+            self._start_apps = []
+            return self._start_apps
+        apps = []
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+                 "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            data = json.loads((out.stdout or "").strip() or "[]")
+            data = data if isinstance(data, list) else [data]
+            apps = [a for a in data if isinstance(a, dict) and a.get("Name") and a.get("AppID")]
+        except Exception as exc:
+            log.info("Get-StartApps unavailable: %s", exc)
+        self._start_apps = apps   # publish the finished list (other threads never see a half-filled one)
+        return self._start_apps
+
+    # ── URLs ─────────────────────────────────────────────────────────────────
+
+    def open_url(self, url: str, then_js: str = None, browser: str = None) -> str:
+        """Open a URL in a named browser, the embedded JARVIS browser, or the default browser."""
+        if not str(url or "").lower().startswith(("http://", "https://")):
+            # The URL becomes a browser command-line argument: '--gpu-launcher=…' would run a program.
+            return f"I only open web addresses (http/https), not '{url}'."
+        try:
+            exe = BROWSERS.get((browser or "").strip().lower())
+            if exe is None and (browser or "").strip().lower() in BROWSERS.values():
+                exe = browser.strip().lower()
+            if exe and os.name == "nt":
+                # Only known browser executables — never an arbitrary program named by user/LLM text.
+                os.startfile(exe, arguments=url)  # type: ignore[attr-defined]
+                return f"Opened {url} in {browser.strip().title()}."
+            if self._browser_callback:
+                self._browser_callback(url, then_js)
+                return f"Opened {url} in JARVIS browser."
+            webbrowser.open(url)
+            return f"Opened {url} in your browser."
+        except Exception as e:
+            return f"Failed to open URL: {e}"
+
+    @staticmethod
+    def _site_url(text: str):
+        raw = text.strip().rstrip(".!?")
+        text = raw.lower()
+        if text.startswith(("http://", "https://")):
+            return raw.split()[0]          # keep the path's case (YouTube IDs); never pass trailing words
+        m = re.fullmatch(r"[\w-]+(?:\.[\w-]+)*\.([a-z]{2,24})(/\S*)?", text)
+        if text.startswith("www.") or (m and m.group(1) not in _FILE_EXTS):
+            return "https://" + raw.split()[0]
+        if text in _SITE_MAP:
+            return _SITE_MAP[text]
+        for key in sorted(_SITE_MAP, key=len, reverse=True):
+            if re.search(rf"\b{re.escape(key)}\b", text) and len(key) > 1:
+                return _SITE_MAP[key]
+        return None
+
+    @staticmethod
+    def clean_query(query: str) -> str:
+        """'a video called rick roll' → 'rick roll'; 'some songs by arijit' → 'songs by arijit'."""
+        q = (query or "").strip().rstrip(".!?")
+        q = re.sub(r"^(?:me\s+)?(?:a|an|the|some)\s+", "", q, flags=re.I)
+        q = re.sub(r"^(?:video|song|track|music video|clip|movie|film)s?\s+(?:(?:called|named|titled|of|about)\s+)?(?!by\b)", "", q,
+                   flags=re.I)
+        q = re.sub(r"\s+(?:on|in)\s+(?:youtube|spotify)$", "", q, flags=re.I)
+        return q.strip() or query
+
+    def _site_action_url(self, url: str, query: str):
+        """Refine a site URL with a search/play query. Returns (url, then_js)."""
+        query = self.clean_query(query)
+        encoded = quote_plus(query)
+        if "youtube.com" in url:
+            direct = youtube_first_video(query)
+            if direct:
+                return direct, None
+            js = ("setTimeout(function(){var v=document.querySelector('ytd-video-renderer a#thumbnail, "
+                  "a#video-title');if(v){v.click();}},2500);")
+            return f"https://www.youtube.com/results?search_query={encoded}", js
+        if "spotify" in url:
+            return f"https://open.spotify.com/search/{quote_plus(query)}", None
+        if "reddit.com" in url:
+            return f"https://www.reddit.com/search/?q={encoded}", None
+        if "amazon." in url:
+            return f"https://www.amazon.com/s?k={encoded}", None
+        if "wikipedia" in url:
+            return f"https://en.wikipedia.org/w/index.php?search={encoded}", None
+        if "github.com" in url:
+            return f"https://github.com/search?q={encoded}", None
+        if "maps.google" in url:
+            return f"https://www.google.com/maps/search/{encoded}", None
+        return f"https://www.google.com/search?q={encoded}", None
+
+    # ── Launching ────────────────────────────────────────────────────────────
+
+    def launch_app_by_name(self, app_name, browser: str = None):
+        """Open an app, website or folder described in natural language."""
+        try:
+            text = (app_name or "").strip()
+            if not text:
+                return "Please tell me what to open."
+            from skills.command_processor import normalize_site_names
+            text = normalize_site_names(text)          # "go to yputube" → "go to youtube"
+            direct = _NAV_PREFIX.sub("", text.rstrip(".!?")).strip()
+            if re.fullmatch(r"https?://\S+|[\w-]+(?:\.[\w-]+)+(?:/\S*)?", direct, re.I) and self._site_url(direct):
+                return self.open_url(self._site_url(direct), None, browser)   # URL case preserved
+            low = text.lower().rstrip(".!?")
+            low = _NAV_PREFIX.sub("", low).strip()
+            query = None
+            m = _ACTION.search(low)
+            verb = None
+            if m:
+                verb, query = m.group(1).lower(), m.group(2).strip()
+                low = low[:m.start()].strip()
+            # "play despacito" with no site → YouTube.
+            if not low and verb:
+                low = "youtube"
+            if re.match(r"^play\s+", text, re.I) and not m:
+                query = re.sub(r"^play\s+", "", text, flags=re.I)
+                query = re.sub(r"\s+on\s+(youtube|spotify)$", "", query, flags=re.I)
+                low = "spotify web" if re.search(r"on spotify$", text, re.I) else "youtube"
+            site = re.sub(r"\s+(?:website|site|web ?page)$", "", low)
+            url = self._site_url(site)
+            if url and (site not in _APP_ALIASES or site in ("youtube", "google")):
+                then_js = None
+                if query:
+                    url, then_js = self._site_action_url(url, query)
+                result = self.open_url(url, then_js, browser)
+                query = self.clean_query(query) if query else query
+                return result + (f" Playing: {query}." if query and verb in (None, "play", "watch", "listen to", "stream") and "watch?v=" in url else "")
+            name = _FILLER.sub(" ", site)
+            name = re.sub(r"\s+", " ", name).strip()
+            if not name:
+                return "Please tell me which app to open."
+            return self._launch_named_app(name)
+        except Exception as e:
+            log.exception("launch failed")
+            return f"Error launching application: {e}"
+
+    def open_app(self, app_name: str) -> str:
+        return self.launch_app_by_name(app_name)
+
+    def _launch_named_app(self, name: str) -> str:
+        safe = _SAFE_NAME.sub("", name).strip()
+        if not safe:
+            return "That doesn't look like an application name."
+        # Known folders
+        folders = {"desktop": Path.home() / "Desktop", "downloads": Path.home() / "Downloads",
+                   "documents": Path.home() / "Documents", "pictures": Path.home() / "Pictures",
+                   "music": Path.home() / "Music", "videos": Path.home() / "Videos"}
+        if safe in folders or safe.rstrip("s") + "s" in folders:
+            folder = folders.get(safe) or folders[safe.rstrip("s") + "s"]
+            return self._shell_open(str(folder), safe.title() + " folder")
+        if safe in _APP_ALIASES:
+            return self._shell_open(_APP_ALIASES[safe], safe.title(), expect=_PROCESS_NAMES.get(safe))
+        shortcut = self._find_start_menu_shortcut(safe)
+        if shortcut:
+            return self._shell_open(shortcut, Path(shortcut).stem)
+        app = self._match_start_app(safe)
+        if app:
+            return self._shell_open(f"shell:AppsFolder\\{app['AppID']}", app["Name"], via_explorer=True)
+        info = self._match_installed(safe)
+        if info:
+            exe = info.get("executable")
+            if exe and os.path.exists(exe):
+                return self._shell_open(exe, info["name"], expect=[os.path.basename(exe).lower()])
+            loc = info.get("location")
+            if loc and os.path.isdir(loc):
+                exes = [p for p in Path(loc).glob("*.exe") if "unins" not in p.name.lower()]
+                if exes:
+                    return self._shell_open(str(exes[0]), info["name"], expect=[exes[0].name.lower()])
+            return f"{info['name']} is installed, but I couldn't find its program file."
+        # Let ShellExecute try App Paths for "<name>.exe" (e.g. 'spotify' → spotify.exe).
+        if re.fullmatch(r"[\w.-]+", safe):
+            result = self._shell_open(safe if safe.endswith(".exe") else safe + ".exe", safe.title(),
+                                      quiet_fail=True)
+            if result:
+                return result
+        return (f"I couldn't find an app called '{name}'. Try 'list apps {name.split()[0]}' "
+                f"to see what's installed.")
+
+    def _match_start_app(self, name: str):
+        apps = self._get_start_apps()
+        lname = name.lower()
+        exact = [a for a in apps if a.get("Name", "").lower() == lname]
+        if exact:
+            return exact[0]
+        starts = [a for a in apps if a.get("Name", "").lower().startswith(lname)]
+        if starts:
+            return min(starts, key=lambda a: len(a["Name"]))
+        words = [a for a in apps if re.search(_word_re(lname), a.get("Name", "").lower())]
+        return min(words, key=lambda a: len(a["Name"])) if words else None
+
+    def _match_installed(self, name: str):
+        if name in self.installed_apps:
+            return self.installed_apps[name]
+        hits = [k for k in self.installed_apps if re.search(_word_re(name), k)]
+        return self.installed_apps[min(hits, key=len)] if hits else None
+
+    def _find_start_menu_shortcut(self, name: str):
+        if os.name != "nt":
+            return None
+        bases = [Path(root) / "Microsoft/Windows/Start Menu/Programs"
+                 for root in (os.getenv("APPDATA"), os.getenv("PROGRAMDATA") or r"C:\ProgramData") if root]
+        best = None
+        for base in bases:
+            if not base.is_dir():
+                continue
+            for path in base.rglob("*.lnk"):
+                stem = path.stem.lower()
+                if "uninstall" in stem:
+                    continue
+                if stem == name:
+                    return str(path)
+                if re.search(_word_re(name), stem) and (best is None or len(stem) < len(Path(best).stem)):
+                    best = str(path)
+        return best
+
+    def _shell_open(self, target: str, display: str, expect=None, via_explorer: bool = False,
+                    quiet_fail: bool = False):
+        before = self._process_names() if expect else set()
+        try:
+            if via_explorer:
+                subprocess.Popen(["explorer.exe", target])
+            elif os.name == "nt":
+                os.startfile(target)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", target])
+        except OSError as exc:
+            if quiet_fail:
+                return None
+            return f"Windows couldn't open {display}: {exc.strerror or exc}"
+        if expect:
+            deadline = time.time() + 4
+            wanted = {e.lower() for e in expect}
+            while time.time() < deadline:
+                running = self._process_names()
+                if wanted & running:
+                    return f"Opened {display}."
+                time.sleep(0.4)
+            if wanted & before:
+                return f"{display} is already running — brought it up."
+            return f"Asked Windows to open {display}; it hasn't appeared yet."
+        return f"Opened {display}."
+
+    @staticmethod
+    def _process_names():
+        if psutil is None:
+            return set()
+        names = set()
+        for proc in psutil.process_iter(["name"]):
+            try:
+                names.add((proc.info.get("name") or "").lower())
             except Exception:
                 continue
-        
-        return apps
-    
-    def list_installed_apps(self, filter_text=""):
-        """List installed applications"""
-        try:
-            if filter_text:
-                filtered_apps = {k: v for k, v in self.installed_apps.items() 
-                               if filter_text.lower() in k}
-            else:
-                filtered_apps = self.installed_apps
-            
-            if not filtered_apps:
-                return "No applications found matching the filter."
-            
-            result = "Installed Applications:\n"
-            result += "-" * 50 + "\n"
-            
-            count = 0
-            for app_key, app_info in sorted(filtered_apps.items()):
-                if count >= 50:  # Limit output
-                    result += f"... and {len(filtered_apps) - count} more applications\n"
-                    break
-                result += f"{app_info['name']}\n"
-                count += 1
-            
-            return result
-        except Exception as e:
-            return f"Error listing applications: {e}"
-    
-    def launch_app_by_name(self, app_name):
-        """Launch an application by name with enhanced detection"""
-        try:
-            app_name_lower = app_name.lower()
-            
-            # Enhanced common applications with Riot Games and others
-            common_apps = {
-                'notepad': 'notepad.exe',
-                'calculator': 'calc.exe',
-                'calc': 'calc.exe',
-                'paint': 'mspaint.exe',
-                'wordpad': 'wordpad.exe',
-                'cmd': 'cmd.exe',
-                'command prompt': 'cmd.exe',
-                'powershell': 'powershell.exe',
-                'explorer': 'explorer.exe',
-                'file explorer': 'explorer.exe',
-                'task manager': 'taskmgr.exe',
-                'control panel': 'control.exe',
-                'registry editor': 'regedit.exe',
-                'system configuration': 'msconfig.exe',
-                'device manager': 'devmgmt.msc',
-                'disk management': 'diskmgmt.msc',
-                'services': 'services.msc',
-                'event viewer': 'eventvwr.msc',
-                
-                # Popular applications
-                'chrome': 'chrome.exe',
-                'google chrome': 'chrome.exe',
-                'firefox': 'firefox.exe',
-                'opera': 'opera.exe',
-                'opera browser': 'opera.exe',
-                'brave': 'brave.exe',
-                'edge': 'msedge.exe',
-                'microsoft edge': 'msedge.exe',
-                'discord': 'Discord.exe',
-                'steam': 'steam.exe',
-                'spotify': 'Spotify.exe',
-                'vs code': 'Code.exe',
-                'visual studio code': 'Code.exe',
-                'vscode': 'Code.exe',
-                'word': 'WINWORD.EXE',
-                'excel': 'EXCEL.EXE',
-                'powerpoint': 'POWERPNT.EXE',
-                'outlook': 'OUTLOOK.EXE',
-                'teams': 'Teams.exe',
-                'zoom': 'Zoom.exe',
-                'skype': 'Skype.exe',
-                'telegram': 'Telegram.exe',
-                'whatsapp': 'WhatsApp.exe',
-                'whatsapp desktop': 'WhatsApp.exe',
-                'desktop': 'explorer.exe shell:desktop',
-                
-                # Gaming applications
-                'riot games': 'RiotClientServices.exe',
-                'riot': 'RiotClientServices.exe',
-                'riot client': 'RiotClientServices.exe',
-                'league of legends': 'RiotClientServices.exe',
-                'valorant': 'RiotClientServices.exe',
-                'epic games': 'EpicGamesLauncher.exe',
-                'epic': 'EpicGamesLauncher.exe',
-                'origin': 'Origin.exe',
-                'uplay': 'upc.exe',
-                'battle.net': 'Battle.net.exe',
-                'battlenet': 'Battle.net.exe'
-            }
-            
-            # Try common apps first
-            if app_name_lower in common_apps:
-                return self._launch_with_verification(common_apps[app_name_lower], app_name)
-            
-            # Special handling for specific apps
-            if app_name_lower in ['whatsapp', 'whatsapp desktop']:
-                return self._launch_whatsapp()
-            
-            if app_name_lower in ['desktop']:
-                return self._open_desktop()
-            
-            # First try to find exact match in installed apps
-            if app_name_lower in self.installed_apps:
-                app_info = self.installed_apps[app_name_lower]
-                return self._launch_application_verified(app_info)
-            
-            # Try partial match in installed apps
-            matches = [k for k in self.installed_apps.keys() if app_name_lower in k]
-            if matches:
-                # Sort by relevance (shorter matches first)
-                matches.sort(key=len)
-                app_info = self.installed_apps[matches[0]]
-                return self._launch_application_verified(app_info)
-            
-            # Try to find in common installation paths
-            search_paths = [
-                "C:\\Program Files",
-                "C:\\Program Files (x86)",
-                f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Local",
-                f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Roaming"
-            ]
-            
-            # Special handling for browsers like Opera
-            if app_name_lower in ['opera', 'opera browser']:
-                opera_paths = [
-                    "C:\\Program Files\\Opera\\opera.exe",
-                    "C:\\Program Files (x86)\\Opera\\opera.exe",
-                    f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Local\\Programs\\Opera\\opera.exe",
-                    f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Roaming\\Opera Software\\Opera Stable\\opera.exe"
-                ]
-                
-                for opera_path in opera_paths:
-                    if os.path.exists(opera_path):
-                        return self._launch_with_verification(opera_path, app_name)
-            
-            for base_path in search_paths:
-                if os.path.exists(base_path):
-                    for item in os.listdir(base_path):
-                        if app_name_lower in item.lower():
-                            potential_path = os.path.join(base_path, item)
-                            if os.path.isdir(potential_path):
-                                # Look for executable in this directory
-                                for file in os.listdir(potential_path):
-                                    if file.lower().endswith('.exe') and (app_name_lower in file.lower() or 'launcher' in file.lower()):
-                                        exe_path = os.path.join(potential_path, file)
-                                        return self._launch_with_verification(exe_path, app_name)
-            
-            # Try direct execution
-            try:
-                result = subprocess.run(app_name_lower, shell=True, capture_output=True, text=True, timeout=3)
-                if result.returncode == 0:
-                    return f"Launched {app_name} successfully."
-                else:
-                    return f"Failed to launch {app_name}: {result.stderr if result.stderr else 'Command not found'}"
-            except subprocess.TimeoutExpired:
-                return f"Timeout attempting to launch {app_name}"
-            except Exception:
-                pass
-            
-            return f"Could not find '{app_name}'. Application may not be installed or accessible. Try 'list apps {app_name}' to search for similar applications."
-            
-        except Exception as e:
-            return f"Error launching application: {e}"
-    
-    def _launch_with_verification(self, command_or_path, app_name):
-        """Launch command/executable and verify it started"""
-        try:
-            import time
-            
-            # Get current processes
-            current_processes = set(proc.info['name'].lower() for proc in psutil.process_iter(['name']))
-            
-            # Launch the application
-            if os.path.isfile(command_or_path):
-                subprocess.Popen([command_or_path])
-            else:
-                result = subprocess.run(command_or_path, shell=True, capture_output=True, text=True, timeout=5)
-                if result.returncode != 0 and result.stderr:
-                    return f"Failed to launch {app_name}: {result.stderr}"
-            
-            # Wait for process to start
-            time.sleep(2)
-            
-            # Check if new processes appeared
-            new_processes = set(proc.info['name'].lower() for proc in psutil.process_iter(['name']))
-            started_processes = new_processes - current_processes
-            
-            if started_processes:
-                return f"Successfully launched {app_name}. New processes: {', '.join(started_processes)}"
-            else:
-                return f"Attempted to launch {app_name}, but could not verify it started."
-                
-        except subprocess.TimeoutExpired:
-            return f"Timeout launching {app_name}"
-        except Exception as e:
-            return f"Error launching {app_name}: {e}"
-    
-    def _launch_application_verified(self, app_info):
-        """Launch application with verification using app info"""
-        if app_info['executable'] and os.path.exists(app_info['executable']):
-            return self._launch_with_verification(app_info['executable'], app_info['name'])
-        elif app_info['location']:
-            # Try to find executable in install location
-            install_path = Path(app_info['location'])
-            if install_path.exists():
-                exe_files = list(install_path.glob("*.exe"))
-                if exe_files:
-                    return self._launch_with_verification(str(exe_files[0]), app_info['name'])
-        
-        return f"Could not find executable for {app_info['name']}"
-    
-    def _launch_application(self, app_info):
-        """Helper method to launch an application"""
-        try:
-            if app_info['executable'] and os.path.exists(app_info['executable']):
-                subprocess.Popen([app_info['executable']], shell=True)
-                return f"Launched {app_info['name']} successfully."
-            elif app_info['location']:
-                # Try to find executable in install location
-                install_path = Path(app_info['location'])
-                if install_path.exists():
-                    exe_files = list(install_path.glob("*.exe"))
-                    if exe_files:
-                        subprocess.Popen([str(exe_files[0])], shell=True)
-                        return f"Launched {app_info['name']} successfully."
-            
-            return f"Could not find executable for {app_info['name']}"
-            
-        except Exception as e:
-            return f"Error launching {app_info['name']}: {e}"
-    
+        return names
+
+    # ── Closing / info ───────────────────────────────────────────────────────
+
+    def resolve_process_names(self, app_name: str):
+        name = _FILLER.sub(" ", (app_name or "").lower())
+        name = re.sub(r"\s+", " ", name).strip()
+        if name in _PROCESS_NAMES:
+            return _PROCESS_NAMES[name]
+        alias = _APP_ALIASES.get(name, "")
+        if alias.endswith(".exe"):          # "microsoft word" → winword.exe
+            return [alias]
+        name = name.removesuffix(".exe")
+        return [name + ".exe"] if re.fullmatch(r"[\w.-]+", name) else []
+
     def close_app_by_name(self, app_name):
-        """Close an application by name"""
-        try:
-            app_name_lower = app_name.lower()
-            killed_count = 0
-            
-            for proc in psutil.process_iter(['pid', 'name', 'exe']):
-                try:
-                    proc_name = proc.info['name'].lower()
-                    proc_exe = proc.info['exe']
-                    
-                    # Check if process name matches
-                    if (app_name_lower in proc_name or 
-                        (proc_exe and app_name_lower in Path(proc_exe).stem.lower())):
-                        proc.terminate()
-                        killed_count += 1
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            
-            if killed_count > 0:
-                return f"Closed {killed_count} process(es) for {app_name}"
-            else:
-                return f"No running processes found for {app_name}"
-                
-        except Exception as e:
-            return f"Error closing application: {e}"
-    
+        """Gracefully close every process of an app (exact image-name match)."""
+        if psutil is None:
+            return "Process control unavailable."
+        targets = {t.lower() for t in self.resolve_process_names(app_name)}
+        if not targets:
+            return f"I don't know which program '{app_name}' is."
+        procs = []
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if (proc.info.get("name") or "").lower() in targets and proc.info["pid"] not in (0, 4, os.getpid()):
+                    proc.terminate()
+                    procs.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        if not procs:
+            return f"{app_name} doesn't seem to be running."
+        gone, alive = psutil.wait_procs(procs, timeout=5)
+        msg = f"Closed {app_name} ({len(gone)} process{'es' if len(gone) != 1 else ''})."
+        if alive:
+            msg += f" {len(alive)} process(es) did not exit yet."
+        return msg
+
     def get_app_info(self, app_name):
-        """Get detailed information about an application"""
-        try:
-            app_name_lower = app_name.lower()
-            
-            # Find the application
-            if app_name_lower in self.installed_apps:
-                app_info = self.installed_apps[app_name_lower]
-            else:
-                matches = [k for k in self.installed_apps.keys() if app_name_lower in k]
-                if not matches:
-                    return f"Application '{app_name}' not found."
-                app_info = self.installed_apps[matches[0]]
-            
-            result = f"Application Information:\n"
-            result += f"Name: {app_info['name']}\n"
-            result += f"Install Location: {app_info['location'] or 'Unknown'}\n"
-            result += f"Executable: {app_info['executable'] or 'Unknown'}\n"
-            
-            # Check if it's currently running
-            running_processes = []
-            for proc in psutil.process_iter(['pid', 'name', 'exe']):
-                try:
-                    if (app_info['executable'] and 
-                        proc.info['exe'] and 
-                        Path(proc.info['exe']).name.lower() == Path(app_info['executable']).name.lower()):
-                        running_processes.append(proc.info['pid'])
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            
-            if running_processes:
-                result += f"Status: Running (PIDs: {', '.join(map(str, running_processes))})\n"
-            else:
-                result += "Status: Not running\n"
-            
-            return result
-            
-        except Exception as e:
-            return f"Error getting app info: {e}"
-    
-    def install_app_from_web(self, app_name, download_url):
-        """Download and install an application (basic implementation)"""
-        try:
-            import requests
-            
-            # Create downloads directory
-            downloads_dir = Path.home() / "Downloads" / "JARVIS_Downloads"
-            downloads_dir.mkdir(exist_ok=True)
-            
-            # Download the file
-            response = requests.get(download_url, stream=True)
-            response.raise_for_status()
-            
-            # Determine file extension
-            content_type = response.headers.get('content-type', '')
-            if 'application/x-msdos-program' in content_type or download_url.endswith('.exe'):
-                filename = f"{app_name}.exe"
-            elif download_url.endswith('.msi'):
-                filename = f"{app_name}.msi"
-            else:
-                filename = f"{app_name}_installer"
-            
-            filepath = downloads_dir / filename
-            
-            # Save the file
-            with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            result = f"Downloaded {app_name} to {filepath}\n"
-            result += "To install, you can run the installer manually or use 'run installer' command."
-            
-            return result
-            
-        except Exception as e:
-            return f"Error downloading application: {e}"
-    
-    def run_installer(self, installer_path):
-        """Run an installer file"""
-        try:
-            if not os.path.exists(installer_path):
-                return f"Installer file not found: {installer_path}"
-            
-            # Run the installer
-            subprocess.Popen([installer_path], shell=True)
-            return f"Started installer: {installer_path}"
-            
-        except Exception as e:
-            return f"Error running installer: {e}"
-    
+        info = self._match_installed((app_name or "").lower())
+        if not info:
+            return f"Application '{app_name}' not found."
+        running = False
+        if info.get("executable") and psutil:
+            exe = os.path.basename(info["executable"]).lower()
+            running = exe in self._process_names()
+        return (f"Name: {info['name']}\nInstall location: {info.get('location') or 'Unknown'}\n"
+                f"Executable: {info.get('executable') or 'Unknown'}\n"
+                f"Status: {'Running' if running else 'Not running'}")
+
     def uninstall_app(self, app_name):
-        """Attempt to uninstall an application"""
+        """Open Windows' own uninstall page; JARVIS never runs uninstallers silently."""
         try:
-            app_name_lower = app_name.lower()
-            
-            # Find the application
-            if app_name_lower in self.installed_apps:
-                app_info = self.installed_apps[app_name_lower]
-            else:
-                matches = [k for k in self.installed_apps.keys() if app_name_lower in k]
-                if not matches:
-                    return f"Application '{app_name}' not found."
-                app_info = self.installed_apps[matches[0]]
-            
-            # Try to find uninstaller
-            if app_info['location']:
-                uninstall_paths = [
-                    Path(app_info['location']) / "uninstall.exe",
-                    Path(app_info['location']) / "Uninstall.exe",
-                    Path(app_info['location']) / "unins000.exe"
-                ]
-                
-                for uninstall_path in uninstall_paths:
-                    if uninstall_path.exists():
-                        subprocess.Popen([str(uninstall_path)], shell=True)
-                        return f"Started uninstaller for {app_info['name']}"
-            
-            # Fall back to Windows Add/Remove Programs
-            subprocess.Popen(['appwiz.cpl'], shell=True)
-            return f"Opened Add/Remove Programs. Please manually uninstall {app_info['name']}"
-            
+            os.startfile("ms-settings:appsfeatures")  # type: ignore[attr-defined]
+            return f"Opened Installed apps in Settings — search for {app_name} there to uninstall it."
         except Exception as e:
-            return f"Error uninstalling application: {e}"
-    
+            return f"Could not open Settings: {e}"
+
     def create_desktop_shortcut(self, app_name):
-        """Create a desktop shortcut for an application"""
+        info = self._match_installed((app_name or "").lower())
+        if not info or not info.get("executable"):
+            return f"No executable found for '{app_name}'."
         try:
             import win32com.client
-            
-            app_name_lower = app_name.lower()
-            
-            # Find the application
-            if app_name_lower in self.installed_apps:
-                app_info = self.installed_apps[app_name_lower]
-            else:
-                matches = [k for k in self.installed_apps.keys() if app_name_lower in k]
-                if not matches:
-                    return f"Application '{app_name}' not found."
-                app_info = self.installed_apps[matches[0]]
-            
-            if not app_info['executable']:
-                return f"No executable found for {app_info['name']}"
-            
-            # Create shortcut
-            desktop = Path.home() / "Desktop"
-            shortcut_path = desktop / f"{app_info['name']}.lnk"
-            
+            shortcut_path = Path.home() / "Desktop" / f"{info['name']}.lnk"
             shell = win32com.client.Dispatch("WScript.Shell")
             shortcut = shell.CreateShortCut(str(shortcut_path))
-            shortcut.Targetpath = app_info['executable']
-            shortcut.WorkingDirectory = str(Path(app_info['executable']).parent)
+            shortcut.TargetPath = info["executable"]
+            shortcut.WorkingDirectory = str(Path(info["executable"]).parent)
             shortcut.save()
-            
-            return f"Created desktop shortcut for {app_info['name']}"
-            
-        except ImportError:
-            return "Creating shortcuts requires pywin32 library: pip install pywin32"
+            return f"Created desktop shortcut for {info['name']}."
         except Exception as e:
             return f"Error creating shortcut: {e}"
-    
-    def _launch_whatsapp(self):
-        """Special handler for WhatsApp with multiple launch methods"""
-        try:
-            # Method 1: Try Windows Store app
-            try:
-                result = subprocess.run('start ms-windows-store://pdp/?ProductId=9NKSQGP7F2NH', 
-                                      shell=True, capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    time.sleep(3)  # Wait for app to launch
-                    # Check if WhatsApp process is running
-                    for proc in psutil.process_iter(['name']):
-                        if 'whatsapp' in proc.info['name'].lower():
-                            return "Successfully launched WhatsApp from Microsoft Store."
-            except:
-                pass
-            
-            # Method 2: Try direct executable paths
-            whatsapp_paths = [
-                f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Local\\WhatsApp\\WhatsApp.exe",
-                f"C:\\Users\\{os.getenv('USERNAME')}\\AppData\\Roaming\\WhatsApp\\WhatsApp.exe",
-                "C:\\Program Files\\WhatsApp\\WhatsApp.exe",
-                "C:\\Program Files (x86)\\WhatsApp\\WhatsApp.exe"
-            ]
-            
-            for path in whatsapp_paths:
-                if os.path.exists(path):
-                    return self._launch_with_verification(path, "WhatsApp")
-            
-            # Method 3: Try launch via protocol
-            try:
-                subprocess.run('start whatsapp:', shell=True, timeout=3)
-                time.sleep(2)
-                for proc in psutil.process_iter(['name']):
-                    if 'whatsapp' in proc.info['name'].lower():
-                        return "Successfully launched WhatsApp via protocol."
-            except:
-                pass
-            
-            # Method 4: Search for WhatsApp in installed apps more thoroughly
-            for app_key, app_info in self.installed_apps.items():
-                if 'whatsapp' in app_key or 'whatsapp' in app_info['name'].lower():
-                    return self._launch_application_verified(app_info)
-            
-            return "WhatsApp not found. Please install WhatsApp Desktop from the Microsoft Store or official website."
-            
-        except Exception as e:
-            return f"Error launching WhatsApp: {e}"
-    
-    def _open_desktop(self):
-        """Open desktop folder in File Explorer"""
-        try:
-            desktop_path = str(Path.home() / "Desktop")
-            subprocess.run(f'explorer "{desktop_path}"', shell=True)
-            return "Opened Desktop folder in File Explorer."
-        except Exception as e:
-            return f"Error opening desktop: {e}"

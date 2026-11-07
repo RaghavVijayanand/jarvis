@@ -1,6 +1,5 @@
+import re
 import webbrowser
-import subprocess
-import platform
 import requests
 from urllib.parse import quote
 from skills.web_scraper import WebScraperSkill
@@ -79,9 +78,11 @@ Search Results:
 Please create a clear, readable summary without any special formatting symbols."""
 
             summary = llm_brain.process_command(prompt, use_context=False)
+            if getattr(summary, "is_error", False) or not str(summary).strip():
+                return f"Search Results for '{query}':\n\n{search_results}"
             
             # Clean up any remaining markdown symbols that might have been generated
-            cleaned_summary = summary.replace('*', '').replace('#', '').replace('**', '').replace('---', '')
+            cleaned_summary = str(summary).replace('*', '').replace('#', '').replace('---', '')
             
             # Remove excessive bullet points and format cleanly
             lines = cleaned_summary.split('\n')
@@ -89,9 +90,11 @@ Please create a clear, readable summary without any special formatting symbols."
             for line in lines:
                 line = line.strip()
                 if line:
-                    # Remove bullet point symbols
-                    line = line.replace('• ', '').replace('- ', '').replace('* ', '')
-                    clean_lines.append(line)
+                    # Strip leading bullet markers only; a mid-sentence " - " (e.g.
+                    # "2020 - 2021") used to be deleted too.
+                    line = re.sub(r'^(?:[•\-*]\s+)+', '', line)
+                    if line:
+                        clean_lines.append(line)
             
             cleaned_summary = '\n'.join(clean_lines)
             
@@ -127,8 +130,12 @@ Please create a clear, readable summary without any special formatting symbols."
         # Remove command patterns (longer patterns first)
         command_patterns.sort(key=len, reverse=True)
         for pattern in command_patterns:
-            if query.startswith(pattern):
-                query = query[len(pattern):].strip()
+            # Whole-word match only: "website builders" / "finding nemo" used to
+            # lose their first letters ("site builders", "ing nemo").
+            if re.match(re.escape(pattern) + r'\b', query):
+                remainder = query[len(pattern):].strip()
+                if remainder:
+                    query = remainder
                 break
         
         # If still has command words at the start, remove them
@@ -157,14 +164,19 @@ Please create a clear, readable summary without any special formatting symbols."
                         result += f"\n\nSource: {data['AbstractURL']}"
                     return result
                 
-                # Check for related topics
-                if data.get('RelatedTopics'):
+                # Check for related topics (entries may be groups: {"Name", "Topics": [...]})
+                topics = []
+                for topic in data.get('RelatedTopics') or []:
+                    if not isinstance(topic, dict):
+                        continue
+                    group = topic.get('Topics') if isinstance(topic.get('Topics'), list) else [topic]
+                    topics.extend(t for t in group if isinstance(t, dict) and t.get('Text'))
+                if topics:
                     result = f"Related information for '{query}':\n\n"
-                    for i, topic in enumerate(data['RelatedTopics'][:3], 1):
-                        if isinstance(topic, dict) and topic.get('Text'):
-                            result += f"{i}. {topic['Text']}\n"
-                            if topic.get('FirstURL'):
-                                result += f"   Source: {topic['FirstURL']}\n"
+                    for i, topic in enumerate(topics[:3], 1):
+                        result += f"{i}. {topic['Text']}\n"
+                        if topic.get('FirstURL'):
+                            result += f"   Source: {topic['FirstURL']}\n"
                     return result
             
             # Final fallback - provide search URLs
@@ -178,155 +190,6 @@ This might be due to network issues or search engine restrictions."""
             
         except Exception:
             return f"Search temporarily unavailable. You can search manually at: https://www.google.com/search?q={quote(query)}"
-    
-    def _extract_urls_from_results(self, search_results):
-        """Extract URLs from search results text"""
-        import re
-        # Find URLs in the search results
-        url_pattern = r'🔗 (https?://[^\s\n]+)'
-        urls = re.findall(url_pattern, search_results)
-        return urls
-    
-    def _create_comprehensive_summary(self, query, urls, llm_brain=None):
-        """Create comprehensive summary by scraping content from multiple URLs and using LLM for summarization"""
-        summaries = []
-        successful_scrapes = 0
-        all_content = []
-        
-        summary_header = f"📋 **Comprehensive Summary for '{query}'**\n"
-        summary_header += f"📊 Analyzed {len(urls)} sources\n\n"
-        
-        for i, url in enumerate(urls, 1):
-            if successful_scrapes >= 6:  # Limit to top 6 successful scrapes
-                break
-                
-            try:
-                content = self._scrape_website_content(url)
-                if content and len(content.strip()) > 100:  # Only include substantial content
-                    successful_scrapes += 1
-                    domain = self._extract_domain(url)
-                    
-                    # Store content for LLM summarization
-                    all_content.append({
-                        'domain': domain,
-                        'url': url,
-                        'content': content[:2000]  # Limit content length for LLM
-                    })
-                    
-            except Exception as e:
-                continue  # Skip failed scrapes
-        
-        if all_content and llm_brain:
-            # Use LLM to create comprehensive summary
-            try:
-                combined_content = ""
-                for item in all_content:
-                    combined_content += f"\n\nSource: {item['domain']} ({item['url']})\nContent: {item['content']}\n"
-                
-                prompt = f"""Please create a comprehensive summary of the following web search results for the query "{query}". 
-
-Analyze the content from these {len(all_content)} sources and provide:
-1. A brief overview of the topic
-2. Key information from each source
-3. Any important details, dates, or facts
-4. Conclusion with the most relevant information
-
-Sources and content:
-{combined_content}
-
-Please format the response clearly with sections and include source references."""
-
-                llm_summary = llm_brain.process_command(prompt, use_context=False)
-                
-                # Add source list at the end
-                source_list = "\n\n📚 **Sources:**\n"
-                for i, item in enumerate(all_content, 1):
-                    source_list += f"{i}. {item['domain']} - {item['url']}\n"
-                
-                return summary_header + llm_summary + source_list
-                
-            except Exception as e:
-                # Fallback to manual summary if LLM fails
-                pass
-        
-        # Fallback: Create manual summary if LLM not available or fails
-        if all_content:
-            result = summary_header
-            for i, item in enumerate(all_content, 1):
-                summary_item = f"## {i}. {item['domain']}\n"
-                summary_item += f"🔗 **Source:** {item['url']}\n\n"
-                summary_item += f"📄 **Content:**\n{item['content'][:800]}{'...' if len(item['content']) > 800 else ''}\n\n"
-                summary_item += "---\n\n"
-                result += summary_item
-            
-            result += f"✅ **Summary complete** - Successfully analyzed {len(all_content)} sources"
-            return result
-        else:
-            # Fallback to original search results if scraping fails
-            return f"⚠️ Could not scrape detailed content. Here are the search results:\n\n{self.scraper.search_google(query, num_results=6)}"
-    
-    def _scrape_website_content(self, url):
-        """Scrape and summarize content from a website"""
-        try:
-            import requests
-            from bs4 import BeautifulSoup
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
-            
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Remove script and style elements
-            for element in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                element.decompose()
-            
-            # Extract text from main content areas
-            content_selectors = [
-                'main', 'article', '.content', '.post', '.entry',
-                '.article-content', '.post-content', '#content'
-            ]
-            
-            text_content = ""
-            for selector in content_selectors:
-                elements = soup.select(selector)
-                if elements:
-                    text_content = elements[0].get_text()
-                    break
-            
-            # If no main content found, get all paragraph text
-            if not text_content:
-                paragraphs = soup.find_all('p')
-                text_content = ' '.join([p.get_text() for p in paragraphs])
-            
-            # Clean and format the text
-            lines = text_content.split('\n')
-            cleaned_lines = [line.strip() for line in lines if line.strip()]
-            cleaned_text = ' '.join(cleaned_lines)
-            
-            # Remove extra whitespace
-            import re
-            cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
-            
-            return cleaned_text.strip()
-            
-        except Exception as e:
-            return None
-    
-    def _extract_domain(self, url):
-        """Extract domain name from URL"""
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            domain = parsed.netloc
-            if domain.startswith('www.'):
-                domain = domain[4:]
-            return domain.title()
-        except:
-            return "Unknown Source"
     
     def search_wikipedia(self, query, open_browser=False):
         """Search Wikipedia - now using web scraping by default"""

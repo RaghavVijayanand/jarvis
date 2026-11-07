@@ -1,0 +1,71 @@
+{
+ "model": "ollama:qwen3:4b-instruct",
+ "laya": false,
+ "results": [
+  {
+   "category": "chat",
+   "said": "how are you doing today",
+   "passed": true,
+   "problems": [],
+   "seconds": 3.13,
+   "path": "ai",
+   "actions": [],
+   "reply": "Well, I'm functioning optimally, thank you for asking. Though I don't have feelings, I'm always here to assist with whatever you need\u2014whether it's opening an app, setting a reminder, or just keeping the system running smoothly. How can I help you tonight?"
+  },
+  {
+   "category": "chat",
+   "said": "what is world peace",
+   "passed": true,
+   "problems": [],
+   "seconds": 4.43,
+   "path": "ai",
+   "actions": [],
+   "reply": "World peace is the state in which all nations, communities, and individuals live without conflict, violence, or aggression. It encompasses the absence of war between countries, the reduction of global tensions, and the promotion of cooperation, understanding, and mutual respect among diverse culture"
+  },
+  {
+   "category": "chat",
+   "said": "tell me a joke",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "utility_skill.tell_joke",
+     ""
+    ]
+   ],
+   "reply": "Done."
+  },
+  {
+   "category": "chat",
+   "said": "explain black holes in one sentence",
+   "passed": true,
+   "problems": [],
+   "seconds": 2.73,
+   "path": "ai",
+   "actions": [],
+   "reply": "A black hole is a region of spacetime where gravity is so intense that nothing, not even light, can escape from it."
+  },
+  {
+   "category": "chat",
+   "said": "what time is it",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [],
+   "reply": "It's 10:55 PM on Friday, October 02."
+  },
+  {
+   "category": "chat",
+   "said": "thanks jarvis",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [],
+   "reply": "Happy to help."
+  }
+ ]
+}

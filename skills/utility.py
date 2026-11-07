@@ -1,15 +1,10 @@
-import random
+import ast
 import math
+import operator
+import random
 import re
-from datetime import datetime, timedelta
-import pytz
-import time as time_module
+import secrets
 import string
-try:
-    import tzlocal
-except ImportError:
-    tzlocal = None
-from asteval import Interpreter
 
 class UtilitySkill:
     def __init__(self):
@@ -25,132 +20,103 @@ class UtilitySkill:
             "How do you organize a space party? You planet!",
             "Why did the math book look so sad? Because it had too many problems!"
         ]
-        
-        # Initialize conversation context for maintaining continuity
-        self.conversation_context = {
-            "last_command": None,
-            "pending_action": None,
-            "expected_response": None,
-            "context_data": {}
-        }
-    
+
     def tell_joke(self):
         """Tell a random joke"""
         return random.choice(self.jokes)
     
+    _MATH_WORDS = [
+        (r"\bto the power of\b|\braised to(?: the power of)?\b|\^", "**"),
+        (r"\bmultiplied by\b|\btimes\b|×|(?<=\d)\s*x\s*(?=[\d(])|\bx\b(?=\s*\d)", "*"),
+        (r"\bdivided by\b|\bover\b|÷", "/"),
+        (r"\bplus\b", "+"), (r"\bminus\b", "-"),
+        (r"\bsquared\b", "**2"), (r"\bcubed\b", "**3"), (r"\bmod(?:ulo)?\b", "%"),
+    ]
+    _FUNCS = {"sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan,
+              "log": math.log10, "ln": math.log, "abs": abs, "round": round}
+    _CONSTS = {"pi": math.pi, "e": math.e}
+    _BINOPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+               ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+               ast.Pow: operator.pow}
+    _UNARY = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+    _MAX_BITS = 14_000        # ~4,200 digits (Python refuses to print >4,300)
+    _MAX_INPUT = 200
+
+    class _Unsafe(ValueError):
+        """Expression uses syntax outside plain arithmetic."""
+
+    def _eval_node(self, node):
+        """Evaluate a whitelisted arithmetic AST.  No names, attributes,
+        subscripts, containers or strings can be reached, and every
+        intermediate integer is size-capped so '9**9**9' or '(9**9999)**9999'
+        cannot hang or exhaust memory."""
+        if isinstance(node, ast.Expression):
+            return self._eval_node(node.body)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in self._CONSTS:
+            return self._CONSTS[node.id]
+        if isinstance(node, ast.UnaryOp) and type(node.op) in self._UNARY:
+            return self._check(self._UNARY[type(node.op)](self._eval_node(node.operand)))
+        if isinstance(node, ast.BinOp) and type(node.op) in self._BINOPS:
+            left, right = self._eval_node(node.left), self._eval_node(node.right)
+            if isinstance(node.op, ast.Pow):
+                if abs(right) > 10_000 and abs(left) not in (0, 1):
+                    raise OverflowError("result too large")
+                if isinstance(left, int) and isinstance(right, int) and right > 0 and abs(left) > 1:
+                    if right * math.log2(abs(left)) > self._MAX_BITS:
+                        raise OverflowError("result too large")
+            return self._check(self._BINOPS[type(node.op)](left, right))
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in self._FUNCS
+                and not node.keywords and len(node.args) <= 2):
+            args = [self._eval_node(a) for a in node.args]
+            if node.func.id == "round" and len(args) == 2:
+                args[1] = int(args[1])
+            return self._check(self._FUNCS[node.func.id](*args))
+        raise self._Unsafe(type(node).__name__)
+
+    def _check(self, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise self._Unsafe("non-numeric result")
+        if isinstance(value, int) and value.bit_length() > self._MAX_BITS:
+            raise OverflowError("result too large")
+        return value
+
     def calculate(self, expression):
-        """Perform mathematical calculations"""
+        """Safely evaluate arithmetic, including phrases like '15% of 200' or 'square root of 81'.
+
+        User text is never passed to eval/exec: it is parsed with ``ast`` and
+        only numeric literals, + - * / // % **, pi/e and a few math functions
+        are evaluated."""
+        failure = f"Could not calculate '{expression}'. Please check your syntax."
         try:
-            # Clean the expression and extract math parts
-            # Remove common command words including contractions
-            words_to_remove = ['calculate', 'calc', 'what', 'whats', "what's", 'is', 'equals', 'solve', 'compute']
-            cleaned_expression = expression.lower()
-            
-            # Use word boundaries to avoid partial replacements
-            import re
-            for word in words_to_remove:
-                # Replace whole words only
-                pattern = r'\b' + re.escape(word) + r'\b'
-                cleaned_expression = re.sub(pattern, ' ', cleaned_expression)
-            
-            # Clean up spacing and extract mathematical expression
-            cleaned_expression = ' '.join(cleaned_expression.split())  # Remove extra spaces
-            
-            # Handle exponents
-            cleaned_expression = cleaned_expression.replace("^", "**")
-            
-            # If expression is empty after cleaning, return original
-            if not cleaned_expression.strip():
-                cleaned_expression = expression.replace("^", "**")
-            
-            # Use asteval for safe evaluation
-            aeval = Interpreter()
-            result = aeval.eval(cleaned_expression)
-            
-            return f"{cleaned_expression} = {result}"
-            
+            text = str(expression).lower().strip().rstrip("?.! =")
+            text = re.sub(r"^(?:what(?:'s|s| is)|calculate|calc|compute|solve|evaluate|how much is|tell me)\s+", "", text)
+            text = re.sub(r"(\d+(?:\.\d+)?)\s*%\s*of\s*(\d+(?:\.\d+)?)", r"(\1/100*\2)", text)
+            text = re.sub(r"\b(?:the\s+)?square root of\s*(\d+(?:\.\d+)?)", r"sqrt(\1)", text)
+            text = re.sub(r"\b(?:the\s+)?cube root of\s*(\d+(?:\.\d+)?)", r"(\1**(1/3))", text)
+            for pattern, repl in self._MATH_WORDS:
+                text = re.sub(pattern, repl, text)
+            text = re.sub(r"\bthe\b", " ", text)
+            text = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)   # 1,000 -> 1000 (keep round(x, 2))
+            text = text.strip()
+            if not re.search(r"\d", text) or len(text) > self._MAX_INPUT:
+                return failure
+            result = self._eval_node(ast.parse(text, mode="eval"))
+            if isinstance(result, float):
+                if math.isinf(result) or math.isnan(result):
+                    return "Error: The result is too large to calculate."
+                result = int(result) if result.is_integer() else round(result, 10)
+            shown = re.sub(r"^(?:what(?:'s|s| is)|calculate|calc|compute|solve|evaluate|how much is|tell me)\s+", "",
+                           str(expression).strip(), flags=re.I).rstrip("?=. ")
+            return f"{shown} = {result}"
         except ZeroDivisionError:
             return "Error: Division by zero"
-        except Exception as e:
-            return f"Could not calculate '{expression}'. Please check your syntax."
-    
-    def convert_units_with_llm(self, query, llm_brain=None):
-        """Use LLM to handle any unit conversion query"""
-        try:
-            if llm_brain:
-                prompt = f"""You are a precise unit conversion assistant. Convert the following query and provide only the conversion result in a clear, concise format.
+        except OverflowError:
+            return "Error: The result is too large to calculate."
+        except Exception:
+            return failure
 
-Query: {query}
-
-Provide the answer in the format: "X unit = Y unit" (e.g., "2 tablespoons butter = 28.4 grams")
-
-If it's a cooking measurement, consider the ingredient type (butter, oil, sugar, flour, etc.) as they have different densities.
-Be precise with the conversion and include the ingredient name if specified.
-Only provide the conversion result, nothing else."""
-                
-                try:
-                    response = llm_brain.process_command(prompt, use_context=False)
-                    # Clean up the response to extract just the conversion
-                    lines = response.split('\n')
-                    for line in lines:
-                        if '=' in line and any(word in line.lower() for word in ['gram', 'ounce', 'pound', 'cup', 'tablespoon', 'teaspoon', 'ml', 'liter']):
-                            return line.strip()
-                    return response.strip()
-                except Exception as e:
-                    # Fallback to basic conversions if LLM fails
-                    return self._basic_conversion_fallback(query)
-            else:
-                return self._basic_conversion_fallback(query)
-                
-        except Exception as e:
-            return f"Error in conversion: {e}"
-    
-    def _basic_conversion_fallback(self, query):
-        """Basic hardcoded conversions as fallback"""
-        query_lower = query.lower()
-        
-        # Extract numbers and common patterns
-        numbers = re.findall(r'\d+(?:\.\d+)?', query)
-        if not numbers:
-            return "Please specify an amount to convert."
-        
-        amount = float(numbers[0])
-        
-        # Common cooking conversions
-        if 'tablespoon' in query_lower or 'tbsp' in query_lower:
-            if 'butter' in query_lower:
-                return f"{amount} tablespoons butter = {amount * 14.2:.1f} grams"
-            elif 'oil' in query_lower:
-                return f"{amount} tablespoons oil = {amount * 13.6:.1f} grams"
-            elif 'sugar' in query_lower:
-                return f"{amount} tablespoons sugar = {amount * 12.5:.1f} grams"
-            elif 'flour' in query_lower:
-                return f"{amount} tablespoons flour = {amount * 7.8:.1f} grams"
-            else:
-                return f"{amount} tablespoons = {amount * 15:.1f} grams (liquid)"
-        
-        elif 'teaspoon' in query_lower or 'tsp' in query_lower:
-            if 'butter' in query_lower:
-                return f"{amount} teaspoons butter = {amount * 4.7:.1f} grams"
-            elif 'oil' in query_lower:
-                return f"{amount} teaspoons oil = {amount * 4.5:.1f} grams"
-            else:
-                return f"{amount} teaspoons = {amount * 5:.1f} grams (liquid)"
-        
-        elif 'cup' in query_lower:
-            if 'butter' in query_lower:
-                return f"{amount} cups butter = {amount * 227:.1f} grams"
-            elif 'oil' in query_lower:
-                return f"{amount} cups oil = {amount * 218:.1f} grams"
-            elif 'sugar' in query_lower:
-                return f"{amount} cups sugar = {amount * 200:.1f} grams"
-            elif 'flour' in query_lower:
-                return f"{amount} cups flour = {amount * 125:.1f} grams"
-            else:
-                return f"{amount} cups = {amount * 240:.1f} grams (liquid)"
-        
-        return "I can help with tablespoons, teaspoons, and cups to grams conversions. Please specify the measurement and ingredient."
-    
     def generate_password(self, length=12, include_symbols=True):
         """Generate a secure password"""
         
@@ -165,7 +131,8 @@ Only provide the conversion result, nothing else."""
             if include_symbols:
                 chars += "!@#$%^&*"
             
-            password = ''.join(random.choice(chars) for _ in range(length))
+            # secrets, not random: passwords must come from a CSPRNG.
+            password = ''.join(secrets.choice(chars) for _ in range(length))
             return f"Generated password: {password}"
             
         except Exception as e:
@@ -212,249 +179,3 @@ Only provide the conversion result, nothing else."""
             
         except Exception as e:
             return f"Error generating random number: {e}"
-    
-    def count_words(self, text):
-        """Count words in text"""
-        if not text.strip():
-            return "No text provided to count."
-        
-        words = len(text.split())
-        chars = len(text)
-        chars_no_spaces = len(text.replace(" ", ""))
-        
-        return f"Text analysis: {words} words, {chars} characters, {chars_no_spaces} characters (no spaces)"
-    
-    def get_current_time(self):
-        """Get current local time with timezone information"""
-        try:
-            # Try to get local timezone
-            local_tz = None
-            if tzlocal:
-                try:
-                    local_tz = tzlocal.get_localzone()
-                except pytz.UnknownTimeZoneError:
-                    local_tz = pytz.timezone('UTC')
-            else:
-                try:
-                    local_tz = pytz.timezone(time_module.tzname[0])
-                except pytz.UnknownTimeZoneError:
-                    local_tz = pytz.UTC
-            
-            now = datetime.now(local_tz)
-            time_str = now.strftime("%I:%M:%S %p")
-            timezone_name = now.strftime("%Z")
-            date_str = now.strftime("%A, %B %d, %Y")
-            
-            return f"The current time is {time_str} {timezone_name} on {date_str}"
-        except Exception:
-            # Fallback without timezone info
-            now = datetime.now()
-            time_str = now.strftime("%I:%M:%S %p")
-            date_str = now.strftime("%A, %B %d, %Y")
-            return f"The current time is {time_str} (local time) on {date_str}"
-    
-    def get_current_date(self):
-        """Get current date"""
-        try:
-            # Try to get local timezone
-            local_tz = None
-            if tzlocal:
-                try:
-                    local_tz = tzlocal.get_localzone()
-                except pytz.UnknownTimeZoneError:
-                    local_tz = pytz.timezone('UTC')
-            else:
-                try:
-                    local_tz = pytz.timezone(time_module.tzname[0])
-                except pytz.UnknownTimeZoneError:
-                    local_tz = pytz.UTC
-
-            now = datetime.now(local_tz)
-            date_str = now.strftime("%A, %B %d, %Y")
-            
-            return f"Today is {date_str}"
-        except Exception:
-            now = datetime.now()
-            date_str = now.strftime("%A, %B %d, %Y")
-            return f"Today is {date_str}"
-    
-    def timer_reminder(self, minutes):
-        """Set a simple timer reminder"""
-        try:
-            minutes = float(minutes)
-            if minutes <= 0:
-                return "Timer duration must be positive."
-            
-            end_time = datetime.now() + timedelta(minutes=minutes)
-            return f"Timer set for {minutes} minutes. Will complete at {end_time.strftime('%I:%M %p')}."
-            
-        except Exception as e:
-            return f"Error setting timer: {e}"
-    
-    def set_context(self, command, pending_action=None, expected_response=None, context_data=None):
-        """Set conversation context for maintaining continuity"""
-        self.conversation_context = {
-            "last_command": command,
-            "pending_action": pending_action,
-            "expected_response": expected_response,
-            "context_data": context_data or {}
-        }
-
-    def get_context(self):
-        """Get current conversation context"""
-        return self.conversation_context
-
-    def clear_context(self):
-        """Clear conversation context"""
-        self.conversation_context = {
-            "last_command": None,
-            "pending_action": None,
-            "expected_response": None,
-            "context_data": {}
-        }
-
-    def analyze_command_intent(self, command):
-        """Analyze command to understand user intent and provide context-aware responses"""
-        command_lower = command.lower().strip()
-
-        # Handle location response for weather
-        if (self.conversation_context.get("pending_action") == "weather" and
-            self.conversation_context.get("expected_response") == "location"):
-            city = self._extract_city_name(command_lower)
-            if city:
-                return {"intent": "weather_location_provided", "city": city, "action": "get_weather_for_city"}
-
-        # Setting default location
-        if any(phrase in command_lower for phrase in [
-            "my location as default", "use my location", "current location",
-            "default location", "my city", "local weather"
-        ]):
-            return {"intent": "set_default_location", "action": "request_location_specification"}
-
-        # Weather commands
-        if "weather" in command_lower:
-            city = self._extract_city_name(command_lower)
-            if city:
-                return {"intent": "weather_with_location", "city": city, "action": "get_weather_for_city"}
-            else:
-                return {"intent": "weather_without_location", "action": "request_location"}
-
-        # Possible city name
-        if self._looks_like_city_name(command_lower):
-            return {"intent": "possible_city_name", "city": command_lower, "action": "confirm_city_intent"}
-
-        return {"intent": "general_command", "action": "process_normally"}
-
-    def provide_contextual_response(self, intent_analysis):
-        """Provide contextual response based on intent analysis"""
-        intent = intent_analysis.get("intent")
-
-        if intent == "weather_location_provided":
-            city = intent_analysis.get("city")
-            self.clear_context()
-            return f"Getting weather information for {city}..."
-
-        elif intent == "set_default_location":
-            self.set_context(
-                command="location_setup",
-                pending_action="weather",
-                expected_response="location",
-                context_data={"setup_type": "default"}
-            )
-            return "I'd be happy to use your location as default. Could you please tell me the name of your city?"
-
-        elif intent == "weather_without_location":
-            self.set_context(
-                command="weather_request",
-                pending_action="weather",
-                expected_response="location"
-            )
-            return "I'd be happy to get the weather for you. Could you please specify the city name?"
-
-        elif intent == "possible_city_name":
-            if self.conversation_context.get("pending_action") == "weather":
-                city = intent_analysis.get("city")
-                self.clear_context()
-                return f"Getting weather information for {city}..."
-            else:
-                return None
-
-        return None
-
-    def _extract_city_name(self, command):
-        """Extract city name from command"""
-        weather_words = ["weather", "forecast", "temperature", "climate", "for", "in", "at", "the"]
-        words = command.split()
-        city_words = [word for word in words if word not in weather_words]
-        return " ".join(city_words).strip() if city_words else None
-
-    def _looks_like_city_name(self, command):
-        """Simple heuristic to check if command looks like a city name"""
-        words = command.split()
-        if len(words) > 3:
-            return False
-        command_indicators = [
-            "calculate", "compute", "tell", "show", "open", "close", "run",
-            "start", "stop", "help", "what", "how", "when", "where", "why"
-        ]
-        return not any(indicator in command for indicator in command_indicators)
-    
-    def convert_cooking_measurement(self, query):
-        """Convert cooking measurements from natural language queries"""
-        
-        # Normalize the query
-        query = query.lower().strip()
-        
-        # Common patterns for cooking conversions
-        patterns = [
-            # "2 tablespoons of butter in grams" or "2 tablespoon butter in grams"
-            r'(\d+(?:\.\d+)?)\s*(tablespoons?|tbsp|teaspoons?|tsp|cups?)\s*(?:of\s+)?(\w+)?\s*(?:in|to)\s*(grams?|g)',
-            # "2 tablespoons butter" (implied grams conversion)
-            r'(\d+(?:\.\d+)?)\s*(tablespoons?|tbsp|teaspoons?|tsp|cups?)\s*(?:of\s+)?(\w+)',
-            # "how much is 2 tablespoons of butter"
-            r'(?:how much is|what is)\s*(\d+(?:\.\d+)?)\s*(tablespoons?|tbsp|teaspoons?|tsp|cups?)\s*(?:of\s+)?(\w+)?'
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, query)
-            if match:
-                try:
-                    amount = float(match.group(1))
-                    unit = match.group(2)
-                    ingredient = match.group(3) if len(match.groups()) >= 3 and match.group(3) else "generic"
-                    
-                    # Normalize unit names
-                    if unit in ["tablespoons", "tablespoon", "tbsp"]:
-                        unit = "tablespoons"
-                    elif unit in ["teaspoons", "teaspoon", "tsp"]:
-                        unit = "teaspoons"
-                    elif unit in ["cups", "cup"]:
-                        unit = "cups"
-                    
-                    # Try specific ingredient first, then generic
-                    conversion_key = f"{unit}_{ingredient}" if ingredient else unit
-                    
-                    # Mapping for common cooking measurements to grams
-                    cooking_conversions = {
-                        "tablespoons_butter": 14.2, "teaspoons_butter": 4.7, "cups_butter": 227,
-                        "tablespoons_oil": 13.6, "teaspoons_oil": 4.5, "cups_oil": 218,
-                        "tablespoons_sugar": 12.5, "teaspoons_sugar": 4.2, "cups_sugar": 200,
-                        "tablespoons_flour": 7.8, "teaspoons_flour": 2.6, "cups_flour": 125,
-                        "tablespoons_water": 15, "teaspoons_water": 5, "cups_water": 240,
-                        "tablespoons_milk": 15, "teaspoons_milk": 5, "cups_milk": 240,
-                        "tablespoons": 15, "teaspoons": 5, "cups": 240  # Generic liquid
-                    }
-                    
-                    if conversion_key in cooking_conversions:
-                        grams = amount * cooking_conversions[conversion_key]
-                        ingredient_text = f" of {ingredient}" if ingredient and ingredient != "generic" else ""
-                        return f"{amount} {unit}{ingredient_text} = {grams:.1f} grams"
-                    elif unit + "s" in cooking_conversions:  # Try plural form
-                        grams = amount * cooking_conversions[unit + "s"]
-                        ingredient_text = f" of {ingredient}" if ingredient and ingredient != "generic" else ""
-                        return f"{amount} {unit}{ingredient_text} = {grams:.1f} grams"
-                        
-                except ValueError:
-                    continue
-        
-        return None

@@ -1,6 +1,8 @@
 @echo off
-echo Starting JARVIS AI Assistant GUI...
-cd /d "D:\projects\jarvis"
-call ".venv\Scripts\activate.bat"
-python main_gui.py
-pause
+rem Run JARVIS from source (the tray app). Use build_installer.bat for a real install.
+cd /d "%~dp0"
+if exist ".venv\Scripts\pythonw.exe" (
+    start "" ".venv\Scripts\pythonw.exe" app.py %*
+) else (
+    start "" pythonw app.py %*
+)

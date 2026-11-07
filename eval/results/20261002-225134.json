@@ -1,0 +1,258 @@
+{
+ "model": "ollama:qwen3:4b-instruct",
+ "laya": false,
+ "results": [
+  {
+   "category": "open",
+   "said": "open chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.04,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "open",
+   "said": "start chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "open",
+   "said": "go to chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "open",
+   "said": "hi um can you like start chrome",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "open",
+   "said": "chrome please",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "chrome"
+    ]
+   ],
+   "reply": "Opened Chrome."
+  },
+  {
+   "category": "open",
+   "said": "hey jarvis could you please fire up spotify for me",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "spotify"
+    ]
+   ],
+   "reply": "Opened Spotify."
+  },
+  {
+   "category": "open",
+   "said": "uh launch notepad real quick",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "notepad"
+    ]
+   ],
+   "reply": "Opened Notepad."
+  },
+  {
+   "category": "open",
+   "said": "can you get youtube up",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "youtube"
+    ]
+   ],
+   "reply": "Opened Youtube."
+  },
+  {
+   "category": "open",
+   "said": "pull the calculator up",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "calculator"
+    ]
+   ],
+   "reply": "Opened Calculator."
+  },
+  {
+   "category": "open",
+   "said": "yo open whatsapp",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "whatsapp"
+    ]
+   ],
+   "reply": "Opened Whatsapp."
+  },
+  {
+   "category": "open",
+   "said": "please bring up file explorer",
+   "passed": true,
+   "problems": [],
+   "seconds": 9.15,
+   "path": "ai",
+   "actions": [
+    [
+     "focus",
+     "File Explorer"
+    ],
+    [
+     "open",
+     "explorer"
+    ]
+   ],
+   "reply": "File Explorer is now open and focused. Let me know if there's anything specific you'd like me to do within it!"
+  },
+  {
+   "category": "open",
+   "said": "take me to youtube",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "youtube"
+    ]
+   ],
+   "reply": "Opened Youtube."
+  },
+  {
+   "category": "open",
+   "said": "i need the calculator",
+   "passed": true,
+   "problems": [],
+   "seconds": 7.6,
+   "path": "ai",
+   "actions": [
+    [
+     "focus",
+     "Calculator"
+    ],
+    [
+     "open",
+     "calculator"
+    ]
+   ],
+   "reply": "Opened the Calculator."
+  },
+  {
+   "category": "open",
+   "said": "could you open up word for me",
+   "passed": true,
+   "problems": [],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "open",
+     "word"
+    ]
+   ],
+   "reply": "Opened Word."
+  },
+  {
+   "category": "open",
+   "said": "open settings",
+   "passed": false,
+   "problems": [
+    "missing open(settings)"
+   ],
+   "seconds": 0.0,
+   "path": "fast",
+   "actions": [
+    [
+     "windows.open_settings",
+     "   "
+    ]
+   ],
+   "reply": "Done."
+  },
+  {
+   "category": "open",
+   "said": "can i get notepad open",
+   "passed": false,
+   "problems": [
+    "missing open(notepad)"
+   ],
+   "seconds": 5.57,
+   "path": "ai",
+   "actions": [
+    [
+     "focus",
+     "Notepad"
+    ]
+   ],
+   "reply": "I see. Notepad isn't open right now. Would you like me to open it for you? Or would you prefer to open a different app instead?"
+  }
+ ]
+}

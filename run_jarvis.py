@@ -37,11 +37,16 @@ def main():
             elif arg in ["text", "t", "-t", "--text"]:
                 mode = "text"
                 print("📝 Starting JARVIS in text mode...")
+            elif arg in ["gui", "g", "-g", "--gui"]:
+                import main_gui
+                main_gui.main()
+                return
             elif arg in ["help", "h", "-h", "--help"]:
                 print("Usage: python run_jarvis.py [mode]")
                 print("Modes:")
                 print("  text  - Text input/output mode (default)")
                 print("  voice - Voice mode with speech recognition")
+                print("  gui   - Desktop app")
                 print("  help  - Show this help message")
                 return
             else:
@@ -50,13 +55,15 @@ def main():
         
         # Create and start JARVIS
         jarvis = JARVIS()
+        jarvis.install_signal_handlers()
         jarvis.start(mode)
+        jarvis.shutdown()
         
     except KeyboardInterrupt:
         print("\n👋 JARVIS shutdown by user")
     except ImportError as e:
         print(f"❌ Import error: {e}")
-        print("💡 Try running: python setup.py install")
+        print("💡 Try running: python setup.py")
     except Exception as e:
         print(f"❌ Error starting JARVIS: {e}")
         print("💡 Make sure all dependencies are installed")

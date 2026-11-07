@@ -1,290 +1,125 @@
-# JARVIS AI Assistant - User Guide
+# JARVIS user guide
 
-## Table of Contents
-1. [Introduction](#introduction)
-2. [Features](#features)
-3. [Installation](#installation)
-4. [Configuration](#configuration)
-5. [Usage](#usage)
-6. [Voice Commands](#voice-commands)
-7. [Troubleshooting](#troubleshooting)
-8. [Advanced Configuration](#advanced-configuration)
-9. [Development](#development)
+## Starting
 
-## Introduction
+- **Installed:** Start menu → **JARVIS**. It lives in the system tray (the cyan ring next to the clock). Launching it again while it's running just opens the command bar.
+  - **Ctrl + Shift + Space** anywhere opens the **command bar**. Type, press Enter, and replies appear under it. ↑ recalls earlier requests, Esc hides the bar, and ⤢ opens the dashboard.
+  - **Hold Ctrl + Alt** anywhere to talk to the **cursor buddy** (see *Buddy mode*).
+  - **Click** the tray icon for the command bar, **double-click** it for the dashboard, and **right-click** it for switches (buddy, live voice, start with Windows), Settings and Quit.
+  - Closing the dashboard keeps JARVIS running in the tray. Use *Quit JARVIS* in the tray menu to exit.
+  - Reminders and alarms appear as Windows notifications while the dashboard is closed.
+- **From source:** `python app.py` (the tray app, same as installed) or `start_jarvis_gui.bat`. `python main_gui.py` opens just the dashboard window.
+- **Terminal:** `python jarvis.py` (text), `python jarvis.py voice` (wake word), or `python jarvis.py "what time is it"` (one command).
 
-JARVIS (Just A Rather Very Intelligent System) is a sophisticated AI assistant inspired by Tony Stark's AI from Iron Man. It combines voice recognition, natural language processing, system control, and various intelligent capabilities to provide a comprehensive personal assistant experience.
+## The dashboard
 
-## Features
+- **The orb** in the header, and the large one on the empty chat screen, shows JARVIS's state: cyan standing by, green listening, blue thinking, amber working through steps, and a pulsing wave while speaking. The status pill next to it spells the state out.
+- **Chat** renders Markdown: lists, bold text, links, and code blocks with a copy button. Hover over a reply to copy it. If you scroll up while JARVIS is talking, a **↓ Latest** button takes you back down.
+- **Activity** (the list icon, top right) is a live timeline. Every step JARVIS runs appears there, typed, spoken or queued, with lane badges (L1/L2) for things running at the same time, how long each step took, and why it failed if it did.
+- **System** shows live CPU, memory, disk and battery gauges. **Automate** holds the screen tools and the task queue. **Memory** lets you search and delete what JARVIS remembers.
+- **Settings** is organised into sections: AI Models, Decisions, Voice, Buddy & Hotkeys, Safety, Location and About. Use the search box (Ctrl+F) to find any setting. *Save changes* lights up only when something has changed, and changed rows are marked.
 
-### Core Capabilities
-- 🎤 **Voice Recognition**: Advanced speech-to-text processing
-- 🔊 **Text-to-Speech**: Natural voice synthesis with personality
-- 🧠 **AI Brain**: Intelligent conversation and command processing
-- 💻 **System Control**: Monitor and control your computer
-- 🌐 **Web Integration**: Search and information retrieval
-- 📊 **System Analytics**: Real-time system monitoring
-- 🛠️ **Skill System**: Modular capabilities
+## How JARVIS decides what to do
 
-### Available Skills
-- **Weather**: Get weather information and forecasts
-- **Web Search**: Search Google, Bing, DuckDuckGo, Wikipedia
-- **System Info**: CPU, memory, disk usage, processes
-- **Calculator**: Mathematical calculations
-- **Utilities**: Password generation, dice rolling, jokes
-- **Application Launcher**: Open applications by voice
-- **Time & Date**: Current time and date information
+1. Laya, the local decision model, reads your message and picks a skill: apps, media, files, reminders, screen, system, search, chat… It also flags multi-step and destructive requests. This takes milliseconds and nothing leaves your PC.
+2. If you asked for several things, JARVIS runs them as ordered steps: "open Chrome, go to YouTube and play jazz, then set volume to 30". If you open a browser first, later website steps use that browser.
+3. The chosen skill answers directly. If it can't, the language model takes over, and it can still act through JARVIS's tools.
+4. Anything destructive asks first: shutdown, restart, sign out, sleep, deleting files, closing apps, emptying the Recycle Bin, and risky clicks. Reply **yes** or **no**, in text or by voice.
 
-## Installation
+The header shows **● Laya** (green) when the decision model is loaded and **● Rules** otherwise. `decision status` shows the details.
 
-### Quick Setup (Windows)
-1. Double-click `setup.bat` to run automatic setup
-2. Follow the prompts to install dependencies
-3. Run `start.bat` to launch JARVIS
+## Things to try
 
-### Manual Setup
-1. Ensure Python 3.8+ is installed
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Copy `.env.example` to `.env` and configure API keys
-4. Run JARVIS:
-   ```bash
-   python jarvis.py
-   ```
+**Apps and web**
 
-### System Requirements
-- **OS**: Windows 10/11, macOS, or Linux
-- **Python**: 3.8 or higher
-- **RAM**: 4GB minimum, 8GB recommended
-- **Microphone**: For voice features
-- **Internet**: For AI and web features
+- `open spotify`, `close chrome`, `list apps adobe`
+- `go to github.com`, `play lo-fi beats`, `open youtube and play interstellar soundtrack`
 
-## Configuration
+**Media and volume**
 
-### Environment Variables (.env file)
-```bash
-# OpenAI API Key (for advanced AI responses)
-OPENAI_API_KEY=your_openai_api_key_here
+- `pause`, `next track`, `previous song`, `what's playing` (needs `winsdk`)
+- `volume 35`, `turn it down`, `mute`, `unmute`
 
-# Weather API Key (optional)
-WEATHER_API_KEY=your_weather_api_key_here
-```
+**PC control**
 
-### Basic Configuration (config.py)
-- **Wake Word**: Default "hey jarvis"
-- **Voice Settings**: Rate, volume, voice selection
-- **AI Model**: GPT model selection
-- **Personality**: Professional, helpful, subtle humor
+- `lock my pc`, `show desktop`, `minimize chrome`, `switch to notepad`, `list windows`, `close all windows`
+- `open bluetooth settings`, `wifi settings`, `brightness 60`
+- `restart the computer`, `shut down`, `sleep`, `cancel shutdown`
 
-## Usage
+**Files** (default folder: Documents)
 
-### Starting JARVIS
+- `create file notes/todo.txt with content buy milk`, `make a new file called ideas.txt on my desktop`
+- `read file todo`, `rename todo.txt to groceries`, `copy report.txt to backups/`, `delete file old.txt`
+- `open downloads folder`, `list files in desktop`, `file info report.txt`
 
-#### Option 1: Launcher (Recommended)
-```bash
-python launcher.py
-```
-- Provides GUI for easy mode selection
-- Built-in test runner
-- Status monitoring
+**Time, alarms and reminders** (these survive restarts)
 
-#### Option 2: Direct Launch
-```bash
-# Voice mode (default)
-python jarvis.py
+- `what time is it`, `what's the date`
+- `set an alarm for 6:45 am`, `alarm in 20 minutes`
+- `remind me to call mom in 30 minutes`, `remind me at 5 pm to stretch`, `set a timer for 10 minutes`
+- `every day at 8 am weather`, `list reminders`, `cancel reminder`
 
-# Text mode
-python jarvis.py text
-```
+**Information**
 
-#### Option 3: Batch Files (Windows)
-- `start.bat` - Interactive launcher
-- `setup.bat` - Run setup
+- `weather in Pune`, `will it rain tomorrow`
+- `search for the latest Python release`, `news headlines`, `wikipedia alan turing`
+- `cpu usage`, `memory usage`, `battery`, `disk space`, `system health`, `network info`
+- `what's 18% of 2450`, `square root of 729`
 
-### Modes of Operation
+**Screen**
 
-#### Voice Mode
-- Uses microphone for input
-- Responds with speech
-- Say "Hey JARVIS" to activate
-- Natural conversation interface
+- `take a screenshot`, `what's on my screen`, `click the Save button`, `double click the recycle bin`
+- `type hello from JARVIS` (any language), `press ctrl+s`
+- `automate open notepad and write a haiku`. The vision model drives the mouse and keyboard. Stop it with **Ctrl+Alt+Esc** or by moving the mouse into a screen corner.
 
-#### Text Mode
-- Keyboard input only
-- Text responses
-- Good for testing or quiet environments
-- Type commands directly
+**Memory**
 
-## Voice Commands
+- `remember that I'm allergic to peanuts`, `my name is Raghav`, `I live in Chennai`
+- `what do you know about me`, `forget peanuts`, `forget everything`
+- Or use **🧠 Memory** in the sidebar to view, add and remove facts.
 
-### Basic Commands
-- **"Hey JARVIS"** - Wake up JARVIS
-- **"Sleep"** - Put JARVIS in standby mode
-- **"Goodbye"** - Exit JARVIS
+**Models**
 
-### System Commands
-- **"System status"** - Get comprehensive system report
-- **"Running processes"** - Show top CPU-using processes
-- **"Disk usage"** - Show storage information
-- **"What time is it?"** - Current time
-- **"What's the date?"** - Current date
+- `list models`, `switch model gemini-flash`, `benchmark models`, `refresh models`, `clear history`
 
-### Application Control
-- **"Open [application]"** - Launch applications
-  - "Open notepad"
-  - "Open calculator"
-  - "Open browser"
-  - "Open file explorer"
+## The Automation page
 
-### Information & Search
-- **"Search for [query]"** - Web search
-- **"Wikipedia [topic]"** - Wikipedia search
-- **"Weather"** - Current weather
-- **"News"** - Current headlines
+- **Screen vision:** take a screenshot, describe the screen, or click something by description.
+- **Multi-step task:** *Plan Steps* shows how JARVIS will split and route the task without running it. *Add to Queue* runs it.
+- **Task queue:** a real queue. **Pause** lets the current task finish and holds the rest, **Resume** continues, **Clear** empties it, and **Stop Current** stops a running plan or automation. Chat messages always go ahead of queued tasks.
 
-### Utilities
-- **"Tell me a joke"** - Random joke
-- **"Calculate [expression]"** - Math calculations
-- **"Flip a coin"** - Coin flip
-- **"Roll dice"** - Roll dice
+## Buddy mode (cursor companion)
 
-### Conversation
-- **"How are you?"** - Status check
-- **"Who are you?"** - JARVIS introduction
-- **"Clear history"** - Reset conversation
+Buddy mode is on by default. A small cyan dot follows your cursor.
+
+- **Hold Ctrl + Alt** (you can change the hotkey in Settings → Voice), ask your question, and let go. The dot pulses while it listens and spins while it thinks. The answer appears in a bubble next to the cursor and is spoken aloud.
+- **Questions about the screen** ("where is…", "how do I…", "show me…", "what is this…", "which button…", "I can't find…") get **pointing**. Arrows fly from the buddy to each control, ring it, and number the steps in order. The buddy doesn't click anything. You stay in control.
+- **Commands** ("open Spotify", "turn the volume down and pause the music") are carried out, just like typing them.
+- Typing a "where is…" question in the chat uses the pointer too.
+- **Privacy:** the screen is captured only when you ask, and the overlay itself never appears in screenshots or screen shares (Windows 10 version 2004 or later).
+- Screen questions need a vision-capable model. Gemini's free key works, as does a local `ollama pull qwen2.5vl:3b`.
+- The **Buddy** button in the chat header turns it off or on.
+
+## Voice
+
+- **Voice On** (chat header) speaks replies. Long answers are summarised aloud, and the full text stays on screen.
+- **🎤** starts **live voice**. JARVIS listens continuously and acts on each command as soon as you finish saying it, without waiting for you to finish the whole sentence. You'll hear a short beep each time it starts something. When you stop talking it says a one-line summary. The first click downloads the speech model (Indian English, about 1 GB, one time only). Until the model is ready, JARVIS uses classic voice chat.
+  - **Connectors:** "and", "then", "after which" and "after that" run commands in order. "simultaneously", "meanwhile", "at the same time" and "while" start a **parallel lane**. For example, "open chrome and play rick roll on youtube **simultaneously** set an alarm for 10 am **after which** change the resolution to 720p" runs the YouTube steps and the alarm-then-resolution steps side by side.
+  - **"next video"** waits until the video is actually playing (via the Windows media session when `winsdk` is installed, otherwise a few seconds) before pressing Next.
+  - **Screen resolution** changes revert automatically after 15 s unless you say **"keep resolution"**. That way you're never stuck on a mode your screen can't show. It resets on reboot.
+  - **Alarms:** the Windows Clock app can't take alarms from other programs, so "open the alarm" opens Clock, and "set the alarm for 10 am" sets a JARVIS alarm (it survives restarts).
+  - Questions and chat ("what's the weather like…", "tell me a joke") wait until you've stopped talking. Actions run immediately. Risky actions (shutdown, closing apps) still ask, and you can answer "yes" or "no" out loud.
+  - Settings → Voice: turn live voice off, choose **Act on commands: at each short pause** if it's too eager, or pick a smaller speech model.
+- Confirmations can be answered by voice.
+- In the terminal, `python jarvis.py voice` waits for the wake word (default "jarvis", matched as a whole word). Set a Vosk model in Settings → Voice to detect it offline.
 
 ## Troubleshooting
 
-### Common Issues
-
-#### "Microphone not detected"
-- Check microphone connection
-- Verify microphone permissions
-- Run `python test.py` to test audio
-
-#### "OpenAI API error"
-- Check API key in `.env` file
-- Verify internet connection
-- JARVIS will use fallback responses without API
-
-#### "Module not found" errors
-- Run `python setup.py` to install dependencies
-- Check Python version (3.8+ required)
-- Try `pip install -r requirements.txt`
-
-#### Voice recognition not working
-- Speak clearly and close to microphone
-- Check microphone levels in system settings
-- Try adjusting energy threshold in config
-
-#### "Permission denied" errors
-- Run as administrator (Windows)
-- Check file permissions
-- Ensure Python has microphone access
-
-### Debugging
-
-#### Enable Debug Mode
-Edit `config.py`:
-```python
-DEBUG_MODE = True
-```
-
-#### Run Tests
-```bash
-python test.py
-```
-
-#### Check Logs
-- Logs are stored in `logs/` directory
-- Check console output for errors
-
-## Advanced Configuration
-
-### Voice Engine Tuning
-```python
-# In config.py
-VOICE_RATE = 200              # Speaking speed (words/minute)
-VOICE_VOLUME = 0.9            # Volume (0.0 to 1.0)
-ENERGY_THRESHOLD = 300        # Microphone sensitivity
-RECOGNITION_TIMEOUT = 1       # Listen timeout
-```
-
-### AI Personality Customization
-```python
-PERSONALITY = {
-    "name": "JARVIS",
-    "style": "professional_helpful",
-    "humor_level": "subtle",
-    "formality": "respectful"
-}
-```
-
-### Adding Custom Skills
-1. Create new skill file in `skills/` directory
-2. Implement skill class with required methods
-3. Import in `jarvis.py`
-4. Add command recognition logic
-
-### Custom Wake Words
-```python
-WAKE_WORD = "computer"  # Change from "hey jarvis"
-```
-
-## Development
-
-### Project Structure
-```
-jarvis/
-├── jarvis.py           # Main JARVIS system
-├── config.py           # Configuration settings
-├── brain.py            # AI processing
-├── voice_engine.py     # Speech recognition/synthesis
-├── system_control.py   # System monitoring
-├── skills/             # Modular skills
-│   ├── weather.py
-
-│   └── utility.py
-├── setup.py            # Installation script
-├── test.py             # Test suite
-├── launcher.py         # GUI launcher
-└── requirements.txt    # Dependencies
-```
-
-### Adding New Features
-1. **Skills**: Add new capabilities in `skills/` directory
-2. **Commands**: Extend command recognition in `jarvis.py`
-3. **Voice**: Modify `voice_engine.py` for audio features
-4. **AI**: Enhance `brain.py` for smarter responses
-
-### API Integration
-- OpenAI: Enhanced conversations
-- Weather APIs: Real weather data
-- News APIs: Current headlines
-- Custom APIs: Extend functionality
-
-### Testing
-- Unit tests in `test.py`
-- Manual testing with `python test.py`
-- Voice testing in safe environment
-
-## Getting Help
-
-### Resources
-- **Documentation**: This file
-- **Source Code**: Well-commented Python files
-- **Tests**: Run `python test.py` for diagnostics
-
-### Support
-- Check console output for error messages
-- Review log files in `logs/` directory
-- Ensure all dependencies are installed
-- Verify microphone and permissions
-
----
-
-*"Sometimes you gotta run before you can walk."* - Tony Stark
-
-**JARVIS** - Your personal AI assistant, ready to serve.
+- **"No AI model is configured"** — add a key in Settings or install Ollama. Everything except open-ended chat still works.
+- **An answer says a model failed** — JARVIS already tried a fallback model. Check the key and connection, or pick another model.
+- **Laya stuck on "loading"** — the first download is about 0.8 GB. Check `%APPDATA%\Jarvis\logs\jarvis.log`. Choose *Rules only* in Settings to skip it.
+- **An app won't open** — try its exact Start-menu name, or `list apps <part of name>`.
+- **Logs:** `%APPDATA%\Jarvis\logs\jarvis.log` (File → Open Data Folder).
+- **Health check:** `python doctor.py`.
+- **Live voice falls back to classic voice** — check `python doctor.py` for "live voice". Run `pip install vosk`, then `python doctor.py --get-voice-model`.
+- **Live voice acts on a half-heard word** — switch Settings → Voice → *Act on commands* to *At each short pause*.
